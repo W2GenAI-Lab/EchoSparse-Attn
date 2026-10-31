@@ -1,0 +1,9 @@
+EchoSparse
+Copyright 2026 The EchoSparse Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The CuTe DSL kernels in echosparse/kernels/ follow the warp-specialized structure of the FlashAttention-4 SM100
+forward kernel and call its pipeline and utility helpers (flash_attn.cute.pipeline, flash_attn.cute.utils),
+including the polynomial exp2 emulation. FlashAttention-4 is distributed under the BSD 3-Clause License,
+Copyright (c) 2022, the respective contributors, as shown by its AUTHORS file.

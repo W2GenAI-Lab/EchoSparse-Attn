@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "echosparse"
+version = "0.1.0"
+description = "LSE-guided block-sparse attention for video diffusion transformers on NVIDIA Blackwell"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+# versions the reported results were measured with
+dependencies = [
+    "torch==2.11.0",
+    "triton==3.6.0",
+    "nvidia-cutlass-dsl==4.5.2",
+    "flash-attn-4==4.0.0b15",
+    "diffusers==0.37.1",
+    "transformers",
+]
+
+[project.optional-dependencies]
+examples = ["accelerate==1.15.0", "imageio==2.38.1", "imageio-ffmpeg==0.7.0"]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["echosparse*"]
