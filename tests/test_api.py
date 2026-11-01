@@ -53,8 +53,6 @@ def test_attention_resolves_at_the_first_call():
 
 def test_presets():
     assert settings("wan") == PRESETS["wan"]
-    assert settings("wan")["compact"] and settings("hunyuan_video")["compact"]
-    assert "compact" not in settings("minimax_h3", "minimax_h3_rtx5090")
     assert settings("minimax_h3")["density"] == 0.10
     assert settings("minimax_h3", "minimax_h3_rtx5090")["density"] == 0.24
     assert settings("minimax_h3", "minimax_h3_rtx5090", density=0.3)["density"] == 0.3
@@ -126,11 +124,12 @@ def test_offload_blocks_restores_the_cpu_masters():
     assert len(model.blocks[4]._forward_pre_hooks) == len(model.blocks[4]._forward_hooks) == 1    # a group of one
 
 
-@pytest.mark.parametrize("L, H, layers, branches, recorded", [
+@pytest.mark.parametrize("L, H, layers, branches, expected", [
     (75600, 40, 39, 2, 1888174080),      # Wan2.1-14B 720p, layers 1-39, CFG
     (118839, 24, 60, 1, 1369866240),     # HunyuanVideo 720p: 118800 video + 39 text tokens
+    (38247, 56, 49, 1, 630110208),       # MiniMax-H3 768p, layers 1-49
 ])
-def test_compact_state_size_of_the_measured_runs(L, H, layers, branches, recorded):
+def test_rtx5090_state_size(L, H, layers, branches, expected):
     from echosparse.attention import _CompactState
 
     st = _CompactState(L, H, "meta")
@@ -139,7 +138,7 @@ def test_compact_state_size_of_the_measured_runs(L, H, layers, branches, recorde
     for plan in range(branches):
         st.plan(plan)
     tensors = [*st.offsets.values(), *(t for p in st.plans for t in p)]
-    assert layers * sum(t.numel() * t.element_size() for t in tensors) == recorded
+    assert layers * sum(t.numel() * t.element_size() for t in tensors) == expected
 
 
 def test_h3_layout_packs_the_target_video_first(monkeypatch):

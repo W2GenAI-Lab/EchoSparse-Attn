@@ -64,8 +64,9 @@ def _cholesky_kernel(g_ptr, m_ptr, D: tl.constexpr):
 
 
 @triton.jit
-def _kmeans_kernel(k_ptr, v_ptr, m_ptr, p_ptr, k4_ptr, v4_ptr, c4_ptr, L, NB, NB4, H: tl.constexpr, D: tl.constexpr,
-                   BK: tl.constexpr, ITERS: tl.constexpr, NP: tl.constexpr):
+def _kmeans_kernel(k_ptr, v_ptr, m_ptr, p_ptr, k4_ptr, v4_ptr, c4_ptr, km_ptr, vm_ptr, L, NB, NB4, H: tl.constexpr,
+                   D: tl.constexpr, BK: tl.constexpr, ITERS: tl.constexpr, NP: tl.constexpr,
+                   WRITE_MEANS: tl.constexpr):
     j = tl.program_id(0)
     h = tl.program_id(1)
     C: tl.constexpr = 16                      # 4 clusters, padded to the smallest tl.dot size
@@ -75,6 +76,9 @@ def _kmeans_kernel(k_ptr, v_ptr, m_ptr, p_ptr, k4_ptr, v4_ptr, c4_ptr, L, NB, NB
     cols = tl.arange(0, D)
     off = (rows[:, None].to(tl.int64) * H + h) * D + cols[None, :]
     kk = tl.load(k_ptr + off, mask=valid[:, None], other=0.0)
+    if WRITE_MEANS:
+        n = tl.minimum(L - j * BK, BK).to(tl.float32)
+        tl.store(km_ptr + (j * H + h) * D + cols, (tl.sum(kk.to(tl.float32), 0) / n).to(tl.bfloat16))
     mh = tl.load(m_ptr + h * D * D + cols[:, None] * D + cols[None, :])
     X = tl.dot(kk, mh)
 
@@ -110,6 +114,9 @@ def _kmeans_kernel(k_ptr, v_ptr, m_ptr, p_ptr, k4_ptr, v4_ptr, c4_ptr, L, NB, NB
     cnt = tl.sum(oh, 0)
     inv = 1.0 / tl.maximum(cnt, 1.0)
     vv = tl.load(v_ptr + off, mask=valid[:, None], other=0.0)
+    if WRITE_MEANS:
+        tl.store(vm_ptr + (j * H + h) * D + cols, (tl.sum(vv.to(tl.float32), 0) / n).to(tl.bfloat16))
+        kk = tl.load(k_ptr + off, mask=valid[:, None], other=0.0, volatile=True)    # reloaded, not kept live
     ohb = oh.to(tl.bfloat16)
     ck = tl.dot(tl.trans(ohb), kk) * inv[:, None]
     cv = tl.dot(tl.trans(ohb), vv) * inv[:, None]
@@ -137,11 +144,14 @@ class Representatives:
         self._probes = torch.empty(H, NUM_PROBES, D, device=device, dtype=torch.bfloat16)
         self._metric = torch.empty(H, D, D, device=device, dtype=torch.bfloat16)
 
-    def build(self, q, k, v):
+    def build(self, q, k, v, k_mean=None, v_mean=None):
+        """Representatives of every block; given k_mean / v_mean (nb, H, D), also the block means."""
         self._metric_and_probes(q)
-        _kmeans_kernel[(self.nb, self.H)](k, v, self._metric, self._probes, self.k, self.v, self.log_counts, self.L,
-                                          self.nb, self.k.shape[1], H=self.H, D=self.D, BK=BK, ITERS=self.iters,
-                                          NP=NUM_PROBES, num_warps=4)
+        means = k_mean is not None
+        _kmeans_kernel[(self.nb, self.H)](k, v, self._metric, self._probes, self.k, self.v, self.log_counts,
+                                          k_mean if means else k, v_mean if means else v, self.L, self.nb,
+                                          self.k.shape[1], H=self.H, D=self.D, BK=BK, ITERS=self.iters,
+                                          NP=NUM_PROBES, WRITE_MEANS=means, num_warps=4, num_stages=1 if means else 3)
 
     def _metric_and_probes(self, q):
         L, H, D, nb = self.L, self.H, self.D, self.nb

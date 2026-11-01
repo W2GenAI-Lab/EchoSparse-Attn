@@ -14,7 +14,7 @@ Blackwell GPUs: B200 (SM100) and RTX 5090 (SM120).
 ![Animated explainer: one attention layer of EchoSparse, from the carried-over LSE to the fused kernel](assets/echosparse-explainer.gif)
 
 *One attention layer on a toy example: the carried-over LSE, block selection, clustered representatives, the
-single normalization and the fused B200 kernel, followed by measured B200 and RTX 5090 results.*
+single normalization and the fused B200 kernel, followed by the measured B200 results.*
 
 Between two denoising steps, the log-sum-exp (LSE) of each attention row changes very little. EchoSparse keeps the
 previous step's LSE of every layer and CFG branch and uses it in three places, all inside one attention kernel:
@@ -34,10 +34,8 @@ kernel to build the first probability map.
 
 On the B200 the kernels are written in CuTe DSL with tcgen05 MMAs and tensor memory. The RTX 5090 has neither, so
 its kernels are written in Triton with ordinary tensor-core dots. They compute the same quantities in the same
-precision. Wan and HunyuanVideo use 64-token tiles. H3 uses two 32-token halves per block to reduce register
-pressure, skips unused prefix query tiles, fuses representative means, and packs token metadata once per forward.
-On RTX 5090, Wan and HunyuanVideo keep compact plans for the next step instead of retaining the full mass map;
-CFG branches share block choices and keep their own LSE histories. The attention state stays on the GPU.
+precision. To fit in 32 GB, the RTX 5090 keeps per layer only the LSE of each CFG branch and the next step's block
+selection, as bit masks; the probability map is scratch shared by all layers.
 
 ## Results
 
@@ -65,22 +63,27 @@ while running 1.12–1.54× faster.
 
 ### RTX 5090
 
-All methods use the same block-wise CPU weight offloading.
+Complete generations with this package and the scripts in `examples/`: 50 denoising steps, one prompt per model
+with the seed of the B200 evaluation, EchoSparse and dense FA4 each run once. The weights of Wan2.1-14B,
+HunyuanVideo and MiniMax-H3 stay in CPU memory and are copied to the GPU group by group (`--offload`); Wan2.1-1.3B
+sits on the GPU. One forward is the median over the dense steps and over the sparse steps of a run.
 
-| Transformer forward | EchoSparse density | FA4 | Sol-Attn | EchoSparse |
-|---|---|---|---|---|
-| MiniMax-H3, 768p, 124 frames | 0.24 | 18.19 s | 11.63 s | 11.58 s |
-| HunyuanVideo, 720p, 129 frames | 0.10 | 63.60 s | 27.00 s | 24.13 s |
-| Wan2.1-14B, 720p, 81 frames, conditional branch | 0.10 | 61.91 s | 46.08 s | 37.26 s |
+| Model | One forward: FA4 / EchoSparse | Whole video: FA4 / EchoSparse | PSNR (B200, same prompt) |
+|---|---|---|---|
+| Wan2.1-14B, 720p | 58.5 s / 36.4 s (1.61×) | — | 22.50 (21.40) dB |
+| Wan2.1-1.3B, 480p | 1.63 s / 0.86 s (1.90×) | 169 s / 119 s (1.42×) | 22.85 (22.67) dB |
+| HunyuanVideo, 720p | 63.5 s / 21.0 s (3.02×) | 3273 s / 1648 s (1.99×) | 31.18 (26.88) dB |
+| MiniMax-H3, 768p, density 0.24 | 18.6 s / 11.7 s (1.59×) | 1475 s / 1235 s (1.19×) | 19.58 (17.11) dB |
 
-MiniMax-H3 at density 0.24 achieves **18.99 dB PSNR**.
+The Wan2.1-14B FA4 run shared host memory bandwidth with a run on a second GPU, so no whole-video times are listed
+for it. Sol-Attn was not run with this package on the RTX 5090.
 
 ## Installation
 
 Requirements: a B200 (SM100) or RTX 5090 (SM120) GPU, CUDA 12.8 or newer, Python 3.10 or newer.
 
 ```bash
-git clone --branch main_sst_preview https://github.com/W2GenAI-Lab/EchoSparse-Attn.git
+git clone https://github.com/W2GenAI-Lab/EchoSparse-Attn.git
 cd EchoSparse-Attn
 pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
 pip install -e ".[examples]"
@@ -142,12 +145,13 @@ python examples/minimax_h3.py --model /path/to/MiniMax-H3 --prompt "A cat surfin
     --preset minimax_h3_rtx5090 --offload
 ```
 
-Offload groups contain one block for Wan, 16 for HunyuanVideo, and eight by default for H3.
-For the H3 forward times above, use `--group-size 12 --pin`.
+Offload groups contain one block for Wan, 16 for HunyuanVideo, and eight by default for H3; `--group-size 12
+--pin` gives the same H3 forward times. `examples/minimax_h3.py` sets
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to limit fragmentation of the CUDA heap on a 32 GB GPU.
 
-Compact persistent attention state occupies about 1.89 GB for Wan2.1-14B (both CFG branches) and 1.37 GB for
-HunyuanVideo at the resolutions above, plus one shared work buffer. H3 retains about 6.4 GB. This state stays
-on the GPU throughout inference.
+The attention state kept between steps occupies about 1.89 GB for Wan2.1-14B (both CFG branches), 1.37 GB for
+HunyuanVideo and 0.63 GB for MiniMax-H3 at the resolutions above, plus one shared work buffer. It stays on the GPU
+throughout inference.
 
 To insist on one GPU type, pass `gpu="b200"` or `gpu="rtx5090"`; a call on a different GPU then raises an error.
 

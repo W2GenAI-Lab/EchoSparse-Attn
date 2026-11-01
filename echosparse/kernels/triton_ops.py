@@ -9,7 +9,6 @@ written by the attention kernel, and for skipped blocks an estimate from the blo
 """
 import math
 
-import torch
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor

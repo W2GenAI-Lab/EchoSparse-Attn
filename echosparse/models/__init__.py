@@ -1,11 +1,10 @@
 from ..attention import EchoSparseAttention
 
-# Settings used for the reported results. The defaults are the same on every GPU; "minimax_h3_rtx5090" is the
-# setting of the RTX 5090 MiniMax-H3 measurements (enable(pipe, preset="minimax_h3_rtx5090")). `compact` (the
-# per-layer state of the RTX 5090 Wan2.1 and HunyuanVideo measurements) has no effect on the B200.
+# Settings used for the reported results; the defaults are the same on every GPU. "minimax_h3_rtx5090" is the
+# MiniMax-H3 setting for the RTX 5090 (enable(pipe, preset="minimax_h3_rtx5090")).
 PRESETS = {
-    "wan": dict(density=0.10, dense_steps=10, dense_layers=(0,), compact=True),
-    "hunyuan_video": dict(density=0.10, dense_steps=10, dense_layers=(), compact=True),
+    "wan": dict(density=0.10, dense_steps=10, dense_layers=(0,)),
+    "hunyuan_video": dict(density=0.10, dense_steps=10, dense_layers=()),
     "minimax_h3": dict(density=0.10, dense_steps=10, dense_layers=(0,)),
     "minimax_h3_rtx5090": dict(density=0.24, dense_steps=10, dense_layers=(0,)),
 }
@@ -35,8 +34,8 @@ def enable(pipe, preset=None, gpu="auto", **overrides):
     """Route the pipeline's self-attention through EchoSparse attention; returns the attention object.
 
     `preset` names an entry of PRESETS (default: the model's own); `overrides` replace its values (density,
-    dense_steps, dense_layers, refine_iters, compact). `gpu` ("auto", "b200" or "rtx5090") selects the kernels; with "auto"
-    they follow the device the attention runs on, so CPU offloading works."""
+    dense_steps, dense_layers, refine_iters). `gpu` ("auto", "b200" or "rtx5090") selects the kernels; with "auto" they
+    follow the device the attention runs on, so CPU offloading works."""
     family = model_family(pipe)
     attention = EchoSparseAttention(**settings(family, preset, **overrides), gpu=gpu)
     if family == "wan":

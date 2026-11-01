@@ -8,9 +8,14 @@ Needs a diffusers build with MiniMax-H3 support (see the README).
 """
 import argparse
 import json
+import os
 from pathlib import Path
 import tempfile
 import wave
+
+# Offloading on a 32 GB GPU leaves little free memory; expandable segments limit fragmentation of the CUDA heap.
+# Set before torch initializes CUDA.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import torch

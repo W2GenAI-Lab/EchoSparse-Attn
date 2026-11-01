@@ -12,7 +12,7 @@ Echo 即指这一点）：用来设定下一步的 softmax 偏移量、选择要
 
 ![动画讲解：EchoSparse 的一层注意力，从沿用的 LSE 到融合 kernel](assets/echosparse-explainer.gif)
 
-*用一个玩具例子演示一层注意力：沿用上一步的 LSE、选块、按聚类得到的代表、统一的归一化、B200 上的融合 kernel，以及 B200 和 RTX 5090 的实测结果。*
+*用一个玩具例子演示一层注意力：沿用上一步的 LSE、选块、按聚类得到的代表、统一的归一化、B200 上的融合 kernel，以及 B200 的实测结果。*
 
 相邻两个去噪步之间，每一行注意力的 log-sum-exp（LSE，softmax 分母的对数）变化很小。EchoSparse 为每一层、每个
 CFG 分支保存上一步的 LSE，在同一个注意力 kernel 里用到三处：
@@ -27,10 +27,8 @@ CFG 分支保存上一步的 LSE，在同一个注意力 kernel 里用到三处�
 前 10 个去噪步用 FlashAttention-4 稠密计算。其中最后一步让所有块都经过本 kernel，生成第一张块概率图。
 
 在 B200 上，kernel 用 CuTe DSL 编写，使用 tcgen05 MMA 和 tensor memory。RTX 5090 没有这两者，所以它的 kernel 用
-Triton 编写，使用普通的 tensor core 点积。两者计算的量和精度相同。Wan 和 HunyuanVideo 使用 64 token 的 tile；H3
-把每块分成两个 32 token 的半块以减少寄存器压力，跳过不用的前缀 query tile、融合代表均值计算，并在每次完整前向开始时
-统一重排 token 元数据。RTX 5090 上的 Wan 和 HunyuanVideo 只保留下一步需要的紧凑计划，不跨步保留完整概率图；
-CFG 分支共享选块，各自保留 LSE。注意力历史状态始终保存在 GPU 上。
+Triton 编写，使用普通的 tensor core 点积。两者计算的量和精度相同。为了放进 32 GB 显存，RTX 5090 在去噪步之间每层只保留
+各 CFG 分支的 LSE 和下一步的选块（存成位图），块概率图是各层共用的临时空间。
 
 ## 结果
 
@@ -56,22 +54,25 @@ Sol-Engine 的对角阈值估计会计算 21–25% 的 KV 块。按上表模型�
 
 ### RTX 5090
 
-各方法均采用相同的 Block-Wise CPU 权重卸载方式。
+用本包和 `examples/` 里的脚本做完整生成：50 个去噪步，每个模型 1 个提示词，种子与 B200 评测相同，EchoSparse 和
+FA4 稠密各跑一遍。Wan2.1-14B、HunyuanVideo、MiniMax-H3 的权重放在 CPU 内存里，按组拷到 GPU（`--offload`）；
+Wan2.1-1.3B 直接放在 GPU 上。单次前向取同一次运行中稠密步和稀疏步各自的中位数。
 
-| Transformer 前向 | EchoSparse 密度 | FA4 | Sol-Attn | EchoSparse |
-|---|---|---|---|---|
-| MiniMax-H3，768p，124 帧 | 0.24 | 18.19 s | 11.63 s | 11.58 s |
-| HunyuanVideo，720p，129 帧 | 0.10 | 63.60 s | 27.00 s | 24.13 s |
-| Wan2.1-14B，720p，81 帧，条件分支 | 0.10 | 61.91 s | 46.08 s | 37.26 s |
+| 模型 | 单次前向：FA4 / EchoSparse | 整段视频：FA4 / EchoSparse | PSNR（B200 同一提示词） |
+|---|---|---|---|
+| Wan2.1-14B，720p | 58.5 s / 36.4 s（1.61×） | — | 22.50（21.40）dB |
+| Wan2.1-1.3B，480p | 1.63 s / 0.86 s（1.90×） | 169 s / 119 s（1.42×） | 22.85（22.67）dB |
+| HunyuanVideo，720p | 63.5 s / 21.0 s（3.02×） | 3273 s / 1648 s（1.99×） | 31.18（26.88）dB |
+| MiniMax-H3，768p，密度 0.24 | 18.6 s / 11.7 s（1.59×） | 1475 s / 1235 s（1.19×） | 19.58（17.11）dB |
 
-MiniMax-H3 在密度 0.24 下的 PSNR 为 **18.99 dB**。
+Wan2.1-14B 的 FA4 运行与另一张 GPU 上的运行共用主机内存带宽，所以不列整段时间。RTX 5090 上没有用本包测 Sol-Attn。
 
 ## 安装
 
 需要 B200（SM100）或 RTX 5090（SM120）GPU、CUDA 12.8 或更新版本、Python 3.10 或更新版本。
 
 ```bash
-git clone --branch main_sst_preview https://github.com/W2GenAI-Lab/EchoSparse-Attn.git
+git clone https://github.com/W2GenAI-Lab/EchoSparse-Attn.git
 cd EchoSparse-Attn
 pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
 pip install -e ".[examples]"
@@ -132,11 +133,12 @@ python examples/minimax_h3.py --model /path/to/MiniMax-H3 --prompt "A cat surfin
     --preset minimax_h3_rtx5090 --offload
 ```
 
-Wan 的权重卸载每组包含 1 个 block，HunyuanVideo 为 16 个，H3 默认为 8 个。
-复现上表的 H3 前向耗时，使用 `--group-size 12 --pin`。
+Wan 的权重卸载每组包含 1 个 block，HunyuanVideo 为 16 个，H3 默认为 8 个；H3 用 `--group-size 12 --pin` 的单次
+前向耗时相同。`examples/minimax_h3.py` 会设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`，减少 32 GB GPU 上
+CUDA 显存的碎片。
 
-上述分辨率下，Wan2.1-14B 两个 CFG 分支的持久注意力状态共约 1.89 GB，HunyuanVideo 约 1.37 GB，另需一份共享工作
-缓冲区；H3 约 6.4 GB。这些状态在推理期间始终保存在 GPU 上。
+上述分辨率下，去噪步之间保留的注意力状态：Wan2.1-14B 两个 CFG 分支共约 1.89 GB，HunyuanVideo 约 1.37 GB，
+MiniMax-H3 约 0.63 GB，另需一份共享工作缓冲区。这些状态在推理期间始终保存在 GPU 上。
 
 若要指定 GPU 类型，传入 `gpu="b200"` 或 `gpu="rtx5090"`；在不符的 GPU 上调用时会报错。
 

@@ -13,11 +13,11 @@ Schedule of a (branch, layer): FA4 for the first `dense_steps - 1` steps, then o
 the fixed-offset kernel (exact output and the first block-probability map), then sparse steps that compute the
 top `density` blocks of every 128-row query tile.
 
-The kernels run on B200 (SM100) and RTX 5090 (SM120) GPUs; `backends` picks them from the device of q.
-
-`compact=True` (RTX 5090 only) keeps less per layer: its offsets and the next step's block selection as two bit masks
-per tile, made at the end of each step instead of the start of the next. The block-probability map, the lists and
-the scales are then scratch shared by all layers; the computation is the same.
+The kernels run on B200 (SM100) and RTX 5090 (SM120) GPUs; `backends` picks them from the device of q. The two keep
+different state between steps; the computation is the same. The B200 keeps, for every (branch, layer), the
+block-probability map, the block lists and the scales, and selects a step's blocks at its start. The RTX 5090
+(32 GB) keeps per layer only the offsets of each branch and the next step's selection as two bit masks per tile,
+made at the end of each step; the map, the lists and the scales are scratch shared by all layers.
 """
 import torch
 import triton
@@ -36,6 +36,8 @@ def dense_attention(q, k, v, return_lse=False):
 
 
 class _LayerState:
+    """B200 state of one (branch, layer)."""
+
     def __init__(self, L, H, device):
         nq, nb = triton.cdiv(L, BM), triton.cdiv(L, BK)
         self.L = L
@@ -52,7 +54,6 @@ class _LayerState:
         words = max(triton.next_power_of_2(nb) // 32, 4 * triton.cdiv(nb, 128))
         self.skip_bits = torch.full((H, nq, words), -1, device=device, dtype=torch.int32)
         self.refine = torch.empty(nq, H, 0, device=device, dtype=torch.int32)
-        self.refined = 0
         self.ready = False
 
     @property
@@ -69,9 +70,9 @@ class _LayerState:
 
 
 class _CompactState:
-    """Offsets of every branch of a layer and its plans (exact and skip bit masks). One branch rewrites its plan in
-    place once the step has used it; with CFG branch 0 writes the other of two plans while later branches still read
-    the current one."""
+    """RTX 5090 state of one layer: the offsets of every branch and the plans (exact and skip bit masks). One branch
+    rewrites its plan in place once the step has used it; with CFG branch 0 writes the other of two plans while later
+    branches still read the current one."""
 
     def __init__(self, L, H, device):
         nb = triton.cdiv(L, BK)
@@ -96,7 +97,7 @@ class _CompactState:
 
 
 class _PlanScratch:
-    """Per-call tensors of the compact state, shared by all layers."""
+    """Per-call tensors of the RTX 5090 path, shared by all layers."""
 
     def __init__(self, L, H, device, refine_width):
         nq, nb = triton.cdiv(L, BM), triton.cdiv(L, BK)
@@ -138,15 +139,13 @@ class EchoSparseAttention:
     `gpu`: "auto" (from the device of q), "b200" or "rtx5090"; see `echosparse.backends`.
     """
 
-    def __init__(self, density=0.10, dense_steps=10, dense_layers=(0,), refine_iters=6, threshold=60.0, gpu="auto",
-                 compact=False):
+    def __init__(self, density=0.10, dense_steps=10, dense_layers=(0,), refine_iters=6, threshold=60.0, gpu="auto"):
         assert dense_steps >= 2, "the first sparse step needs the LSE of a dense step and a full-block step"
         self.density = density
         self.dense_steps = dense_steps
         self.dense_layers = set(dense_layers)
         self.refine_iters = refine_iters
         self.threshold = threshold
-        self.compact = compact
         backends.check_name(gpu)
         self.gpu = gpu
         self.backend = None             # resolved from the device of the first call
@@ -175,8 +174,12 @@ class EchoSparseAttention:
             self._device = q.device
         if layer in self.dense_layers or triton.cdiv(L, BK) < MIN_BLOCKS:
             return dense_attention(q, k, v)
-        if self.compact and self.backend == "rtx5090":
-            return self._compact_call(q, k, v, step, branch, layer, sink)
+        if self.backend == "rtx5090":
+            return self._call_rtx5090(q, k, v, step, branch, layer, sink, rows)
+        return self._call_b200(q, k, v, step, branch, layer, sink)
+
+    def _call_b200(self, q, k, v, step, branch, layer, sink):
+        L, H, D = q[0].shape
         st = self._state(branch, layer, L, H, q.device)
         if step < self.dense_steps - 1 or (step >= self.dense_steps and not st.ready):
             out, lse = dense_attention(q, k, v, return_lse=True)
@@ -187,9 +190,9 @@ class EchoSparseAttention:
         if step < self.dense_steps:
             out = self._full_step(q, k, v, st, buf)
         elif branch == 0:
-            out = self._sparse_step(q, k, v, st, buf, sink, rows)
+            out = self._sparse_step(q, k, v, st, buf, sink)
         else:
-            out = self._shared_step(q, k, v, st, self._states[(0, layer)], buf, rows)
+            out = self._shared_step(q, k, v, st, self._states[(0, layer)], buf)
         st.cur ^= 1
         return out[None]
 
@@ -221,52 +224,49 @@ class EchoSparseAttention:
         st.ready = True
         return out
 
-    def _sparse_step(self, q, k, v, st, buf, sink, rows):
+    def _sparse_step(self, q, k, v, st, buf, sink):
         K = self.K
         L, H, _ = q.shape
         nq, nb = triton.cdiv(L, BM), triton.cdiv(L, BK)
-        if self.backend == "b200":
-            K.block_means(k, v, buf.k_mean, buf.v_mean)         # RTX 5090: inside the k-means kernel
-        top = max(1, int(round(self.density * nb)))
-        refined = max(0, int(round((nb - top) / 3)))
+        K.block_means(k, v, buf.k_mean, buf.v_mean)
+        top, refined = self._budget(nb)
         width = -(-refined // 32) * 32
         if st.refine.shape[-1] != width:
             st.refine = torch.empty(nq, H, width, device=q.device, dtype=torch.int32)
-        st.refined = refined
         keep_prev = st.keep
         st.kc ^= 1
         K.select_blocks(st.mass, keep_prev, st.scale_exact, st.scale_skip, st.keep, st.counts, st.blocks, st.flags,
                         st.skip_bits, st.refine, top, refined, L, sink=1 << 30 if sink is None else sink)
         st.mass.zero_()
         out = torch.empty_like(q)
-        self._attend(q, k, v, st, st, buf, out, rows, mass=st.mass)
+        self._attend(q, k, v, st, st, buf, out, mass=st.mass)
         st.flags.copy_(buf.flags)
         K.estimate_skipped(q, buf.k_mean, st.keep, st.offset, st.next_offset, st.mass, st.scale_exact, st.scale_skip)
         return out
 
-    def _shared_step(self, q, k, v, st, sel, buf, rows):
+    def _shared_step(self, q, k, v, st, sel, buf):
         """A later CFG branch: branch 0's block selection, this branch's own offsets."""
-        if self.backend == "b200":
-            self.K.block_means(k, v, buf.k_mean, buf.v_mean)
+        self.K.block_means(k, v, buf.k_mean, buf.v_mean)
         out = torch.empty_like(q)
-        self._attend(q, k, v, st, sel, buf, out, rows)
+        self._attend(q, k, v, st, sel, buf, out)
         return out
 
-    def _attend(self, q, k, v, st, sel, buf, out, rows, mass=None):
+    def _attend(self, q, k, v, st, sel, buf, out, mass=None):
         K, reps = self.K, buf.reps
-        args = (q, k, v, buf.k_mean, buf.v_mean, sel.skip_bits, out, sel.counts, sel.blocks, st.offset,
-                st.next_offset, buf.flags, sel.refine, reps.k, reps.v, reps.log_counts)
-        if self.backend == "b200":
-            reps.build(q, k, v)
-            K.sparse_attention(*args, mass=mass, threshold=self.threshold)
-        else:
-            reps.build(q, k, v, buf.k_mean, buf.v_mean)
-            K.sparse_attention(*args, mass=mass, threshold=self.threshold, rows=rows, refined=sel.refined)
+        reps.build(q, k, v)
+        K.sparse_attention(q, k, v, buf.k_mean, buf.v_mean, sel.skip_bits, out, sel.counts, sel.blocks, st.offset,
+                           st.next_offset, buf.flags, sel.refine, reps.k, reps.v, reps.log_counts, mass=mass,
+                           threshold=self.threshold)
         # tiles whose offset was too far off: online softmax over the same list, then block-mean compensation
         K.exact_fallback(q, k, v, out, sel.counts, sel.blocks, st.next_offset, buf.flags)
         K.compensate_fallback(q, buf.k_mean, buf.v_mean, sel.keep, st.next_offset, out, buf.flags)
 
-    def _compact_call(self, q, k, v, step, branch, layer, sink):
+    def _budget(self, nb):
+        """Exactly computed blocks per tile, and refined blocks (four representatives each) per tile."""
+        top = max(1, int(round(self.density * nb)))
+        return top, max(0, int(round((nb - top) / 3)))
+
+    def _call_rtx5090(self, q, k, v, step, branch, layer, sink, rows):
         L, H, D = q[0].shape
         st = self._states.get(layer)
         if st is None or st.L != L:
@@ -284,9 +284,7 @@ class EchoSparseAttention:
             return out
         K = self.K
         q, k, v = q[0], k[0], v[0]
-        nb = triton.cdiv(L, BK)
-        top = max(1, int(round(self.density * nb)))
-        refined = max(0, int(round((nb - top) / 3)))
+        top, refined = self._budget(triton.cdiv(L, BK))
         buf = self._scratch(L, H, D, q.device)
         ps = self._plan_scratch
         if ps is None or ps.shape != (L, H, -(-refined // 32) * 32):
@@ -297,25 +295,25 @@ class EchoSparseAttention:
             ps.keep.fill_(1)
             ps.mass.zero_()
             K.block_attention(q, k, v, out, buf.all_counts, buf.all_blocks, offset, ps.next_offset, buf.flags,
-                              mass=ps.mass, threshold=self.threshold, stages=1)
-            K.exact_fallback(q, k, v, out, buf.all_counts, buf.all_blocks, ps.next_offset, buf.flags, per_tile=True)
+                              mass=ps.mass, threshold=self.threshold)
+            K.exact_fallback(q, k, v, out, buf.all_counts, buf.all_blocks, ps.next_offset, buf.flags)
             K.full_step_scales(offset, ps.next_offset, ps.scale_exact, ps.scale_skip, L)
             st.ready.add(branch)
         else:
             exact, skip = st.plan(st.current[0])
             K.rebuild_plan(exact, skip, ps.keep, ps.counts, ps.blocks, ps.refine)
-            K.block_means(k, v, buf.k_mean, buf.v_mean)
-            buf.reps.build(q, k, v)
+            buf.reps.build(q, k, v, buf.k_mean, buf.v_mean)
             if branch == 0:
                 ps.mass.zero_()
             K.sparse_attention(q, k, v, buf.k_mean, buf.v_mean, skip, out, ps.counts, ps.blocks, offset,
                                ps.next_offset, buf.flags, ps.refine, buf.reps.k, buf.reps.v, buf.reps.log_counts,
-                               mass=ps.mass if branch == 0 else None, threshold=self.threshold)
-            K.exact_fallback(q, k, v, out, ps.counts, ps.blocks, ps.next_offset, buf.flags, per_tile=True)
+                               mass=ps.mass if branch == 0 else None, threshold=self.threshold, rows=rows,
+                               refined=refined)
+            K.exact_fallback(q, k, v, out, ps.counts, ps.blocks, ps.next_offset, buf.flags)
             K.compensate_fallback(q, buf.k_mean, buf.v_mean, ps.keep, ps.next_offset, out, buf.flags)
             if branch == 0:
                 K.estimate_skipped(q, buf.k_mean, ps.keep, offset, ps.next_offset, ps.mass, ps.scale_exact,
-                                   ps.scale_skip, tiles_per_program=1)
+                                   ps.scale_skip)
         if branch == 0:
             # the next step's plan, after this step's last use of the current one in a single branch
             plan = 0 if st.current is None else st.current[0] ^ (len(st.offsets) > 1)
