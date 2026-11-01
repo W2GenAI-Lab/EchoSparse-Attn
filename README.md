@@ -7,11 +7,6 @@
 <p>
 <a href="https://w2genai-lab.github.io/blog/EchoSparse/blog.html"><img alt="Blog (English)" src="https://img.shields.io/badge/Blog-English-2a78d6?style=flat-square"></a>
 <a href="https://w2genai-lab.github.io/blog/EchoSparse/zh.html"><img alt="博客（中文）" src="https://img.shields.io/badge/%E5%8D%9A%E5%AE%A2-%E4%B8%AD%E6%96%87-2a78d6?style=flat-square"></a>
-<a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/License-Apache%202.0-555?style=flat-square"></a>
-<img alt="B200 (SM100)" src="https://img.shields.io/badge/B200-SM100-76B900?style=flat-square&logo=nvidia&logoColor=white">
-<img alt="RTX 5090 (SM120)" src="https://img.shields.io/badge/RTX%205090-SM120-76B900?style=flat-square&logo=nvidia&logoColor=white">
-<img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white">
-<img alt="CUDA 12.8+" src="https://img.shields.io/badge/CUDA-12.8%2B-555?style=flat-square">
 </p>
 
 <p><b><a href="https://w2genai-lab.github.io/blog/EchoSparse/blog.html">Blog</a></b> &nbsp;·&nbsp; <b><a href="https://w2genai-lab.github.io/blog/EchoSparse/zh.html">中文博客</a></b> &nbsp;·&nbsp; <a href="README_zh.md">中文说明</a> &nbsp;·&nbsp; <a href="#results">Results</a> &nbsp;·&nbsp; <a href="#installation">Installation</a> &nbsp;·&nbsp; <a href="#usage">Usage</a></p>
