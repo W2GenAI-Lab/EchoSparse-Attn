@@ -192,7 +192,9 @@ Apache License 2.0。第三方来源见 [NOTICE](NOTICE)。
 
 ## 核心贡献者
 
-Shitong Shao、Tian Ye。
+Shitong Shao<sup>\*</sup>、Tian Ye<sup>\*</sup>
+
+<sup>\*</sup> 同等贡献，按姓名首字母排序。
 
 ## 其他贡献者
 

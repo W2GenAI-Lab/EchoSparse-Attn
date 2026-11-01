@@ -219,7 +219,9 @@ Apache License 2.0. See [NOTICE](NOTICE) for third-party attributions.
 
 ## Core contributors
 
-Shitong Shao and Tian Ye.
+Shitong Shao<sup>\*</sup> and Tian Ye<sup>\*</sup>
+
+<sup>\*</sup> Equal contribution, listed in alphabetical order.
 
 ## Contributors
 
