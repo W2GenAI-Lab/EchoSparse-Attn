@@ -1,20 +1,42 @@
-# EchoSparse
+<div align="center">
+
+<h1>EchoSparse</h1>
+
+<p><b>LSE-guided block-sparse attention for video diffusion transformers</b></p>
+
+<p>
+<a href="https://w2genai-lab.github.io/blog/EchoSparse/blog.html"><img alt="Blog (English)" src="https://img.shields.io/badge/Blog-English-2a78d6?style=flat-square"></a>
+<a href="https://w2genai-lab.github.io/blog/EchoSparse/zh.html"><img alt="博客（中文）" src="https://img.shields.io/badge/%E5%8D%9A%E5%AE%A2-%E4%B8%AD%E6%96%87-2a78d6?style=flat-square"></a>
+<a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/License-Apache%202.0-555?style=flat-square"></a>
+<img alt="B200 (SM100)" src="https://img.shields.io/badge/B200-SM100-76B900?style=flat-square&logo=nvidia&logoColor=white">
+<img alt="RTX 5090 (SM120)" src="https://img.shields.io/badge/RTX%205090-SM120-76B900?style=flat-square&logo=nvidia&logoColor=white">
+<img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white">
+<img alt="CUDA 12.8+" src="https://img.shields.io/badge/CUDA-12.8%2B-555?style=flat-square">
+</p>
+
+<p><b><a href="https://w2genai-lab.github.io/blog/EchoSparse/blog.html">Blog</a></b> &nbsp;·&nbsp; <b><a href="https://w2genai-lab.github.io/blog/EchoSparse/zh.html">中文博客</a></b> &nbsp;·&nbsp; <a href="README_zh.md">中文说明</a> &nbsp;·&nbsp; <a href="#results">Results</a> &nbsp;·&nbsp; <a href="#installation">Installation</a> &nbsp;·&nbsp; <a href="#usage">Usage</a></p>
+
+<img src="assets/teaser.png" width="100%" alt="EchoSparse on Wan2.1-14B: 1.70x faster than FA4, closer to the dense video than Sol-Attn and PISA">
+
+</div>
 
 EchoSparse is block-sparse self-attention for video diffusion transformers. The softmax statistics of each
 denoising step echo into the next one: they set its softmax offset, pick the blocks it computes and decide how
 the skipped blocks are compensated. It needs no training and plugs into diffusers pipelines. It runs on NVIDIA
 Blackwell GPUs: B200 (SM100) and RTX 5090 (SM120).
 
-[中文说明](README_zh.md)
+## News
 
-![EchoSparse on Wan2.1-14B: 1.70x faster than FA4, closer to the dense video than Sol-Attn and PISA](assets/teaser.png)
+- **2026-11-01** — The EchoSparse blog post is out: [English](https://w2genai-lab.github.io/blog/EchoSparse/blog.html) · [中文](https://w2genai-lab.github.io/blog/EchoSparse/zh.html).
 
 ## How it works
 
-![Animated explainer: one attention layer of EchoSparse, from the carried-over LSE to the fused kernel](assets/echosparse-explainer.gif)
-
-*One attention layer on a toy example: the carried-over LSE, block selection, clustered representatives, the
-single normalization and the fused B200 kernel, followed by the measured B200 results.*
+<p align="center">
+  <img src="assets/echosparse-explainer.gif" width="85%" alt="Animated explainer: one attention layer of EchoSparse, from the carried-over LSE to the fused kernel">
+  <br>
+  <em>One attention layer on a toy example: the carried-over LSE, block selection, clustered representatives, the
+single normalization and the fused B200 kernel, followed by the measured B200 results.</em>
+</p>
 
 Between two denoising steps, the log-sum-exp (LSE) of each attention row changes very little. EchoSparse keeps the
 previous step's LSE of every layer and CFG branch and uses it in three places, all inside one attention kernel:

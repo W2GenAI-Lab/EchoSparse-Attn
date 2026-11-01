@@ -1,18 +1,40 @@
-# EchoSparse
+<div align="center">
+
+<h1>EchoSparse</h1>
+
+<p><b>面向视频扩散 Transformer 的块稀疏注意力，由上一步的 LSE 引导</b></p>
+
+<p>
+<a href="https://w2genai-lab.github.io/blog/EchoSparse/zh.html"><img alt="博客（中文）" src="https://img.shields.io/badge/%E5%8D%9A%E5%AE%A2-%E4%B8%AD%E6%96%87-2a78d6?style=flat-square"></a>
+<a href="https://w2genai-lab.github.io/blog/EchoSparse/blog.html"><img alt="Blog (English)" src="https://img.shields.io/badge/Blog-English-2a78d6?style=flat-square"></a>
+<a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/License-Apache%202.0-555?style=flat-square"></a>
+<img alt="B200 (SM100)" src="https://img.shields.io/badge/B200-SM100-76B900?style=flat-square&logo=nvidia&logoColor=white">
+<img alt="RTX 5090 (SM120)" src="https://img.shields.io/badge/RTX%205090-SM120-76B900?style=flat-square&logo=nvidia&logoColor=white">
+<img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white">
+<img alt="CUDA 12.8+" src="https://img.shields.io/badge/CUDA-12.8%2B-555?style=flat-square">
+</p>
+
+<p><b><a href="https://w2genai-lab.github.io/blog/EchoSparse/zh.html">中文博客</a></b> &nbsp;·&nbsp; <b><a href="https://w2genai-lab.github.io/blog/EchoSparse/blog.html">English Blog</a></b> &nbsp;·&nbsp; <a href="README.md">English</a> &nbsp;·&nbsp; <a href="#结果">结果</a> &nbsp;·&nbsp; <a href="#安装">安装</a> &nbsp;·&nbsp; <a href="#用法">用法</a></p>
+
+<img src="assets/teaser.png" width="100%" alt="EchoSparse 在 Wan2.1-14B 上比 FA4 快 1.70 倍，比 Sol-Attn 和 PISA 更接近稠密结果">
+
+</div>
 
 EchoSparse 是面向视频扩散模型的块稀疏自注意力。每个去噪步的 softmax 统计量会在下一步被再次利用（名字里的
 Echo 即指这一点）：用来设定下一步的 softmax 偏移量、选择要计算的块，并决定跳过的块如何补偿。不需要训练，可以
 直接接入 diffusers 流水线。可在 NVIDIA Blackwell GPU 上运行：B200（SM100）和 RTX 5090（SM120）。
 
-[English](README.md)
+## 动态
 
-![EchoSparse 在 Wan2.1-14B 上比 FA4 快 1.70 倍，比 Sol-Attn 和 PISA 更接近稠密结果](assets/teaser.png)
+- **2026-11-01** — EchoSparse 技术博客已发布：[中文](https://w2genai-lab.github.io/blog/EchoSparse/zh.html) · [English](https://w2genai-lab.github.io/blog/EchoSparse/blog.html)。
 
 ## 原理
 
-![动画讲解：EchoSparse 的一层注意力，从沿用的 LSE 到融合 kernel](assets/echosparse-explainer.gif)
-
-*用一个玩具例子演示一层注意力：沿用上一步的 LSE、选块、按聚类得到的代表、统一的归一化、B200 上的融合 kernel，以及 B200 的实测结果。*
+<p align="center">
+  <img src="assets/echosparse-explainer.gif" width="85%" alt="动画讲解：EchoSparse 的一层注意力，从沿用的 LSE 到融合 kernel">
+  <br>
+  <em>用一个玩具例子演示一层注意力：沿用上一步的 LSE、选块、按聚类得到的代表、统一的归一化、B200 上的融合 kernel，以及 B200 的实测结果。</em>
+</p>
 
 相邻两个去噪步之间，每一行注意力的 log-sum-exp（LSE，softmax 分母的对数）变化很小。EchoSparse 为每一层、每个
 CFG 分支保存上一步的 LSE，在同一个注意力 kernel 里用到三处：
