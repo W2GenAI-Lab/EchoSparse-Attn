@@ -39,18 +39,29 @@ selection, as bit masks; the probability map is scratch shared by all layers.
 
 ## Results
 
+### RTX 5090
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/results-rtx5090-dark.png">
+  <img alt="RTX 5090: speedup of EchoSparse over FlashAttention-4 (whole video and one sparse-step forward) and its PSNR against FA4, next to the B200 PSNR of the same prompt" src="assets/results-rtx5090.png">
+</picture>
+
+Complete 50-step generations with this package and the scripts in `examples/`, one prompt per model with the seed of
+the B200 evaluation; EchoSparse and dense FA4 each run once on one GPU. The weights of Wan2.1-14B, HunyuanVideo and
+MiniMax-H3 stay in CPU memory and are copied to the GPU group by group (`--offload`); Wan2.1-1.3B sits on the GPU.
+One forward is the median over a run's sparse steps (EchoSparse) and dense steps (FA4). MiniMax-H3 runs at density
+0.24 (`minimax_h3_rtx5090`). Sol-Attn and PISA were not run on the RTX 5090.
+
 ### B200
 
-End-to-end video generation with 50 denoising steps. All methods keep the first 10 steps dense.
-EchoSparse computes 10% of KV blocks; Sol-Attn uses its paper's exact threshold estimator with τ = 1.0;
-PISA computes 12.5% with covariance-aware selection. PSNR is measured against FA4.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/results-b200-dark.png">
+  <img alt="B200: end-to-end speedup over FlashAttention-4 and PSNR against FA4 for EchoSparse, PISA and Sol-Attn on four models" src="assets/results-b200.png">
+</picture>
 
-| Model | Blocks computed: ours / Sol-Attn / PISA | Speedup vs FA4: ours / Sol-Attn / PISA | PSNR: ours / Sol-Attn / PISA |
-|---|---|---|---|
-| Wan2.1-14B, 720p | 10% / 15% / 12.5% | 1.70× / 1.43× / 1.42× | 22.54 / 21.44 / 21.00 dB |
-| Wan2.1-1.3B, 480p | 10% / 16% / 12.5% | 1.41× / 1.31× / 1.18× | 23.76 / 22.57 / 23.52 dB |
-| HunyuanVideo-13B, 720p | 10% / 16% / 12.5% | 1.95× / 1.38× / 1.42× | 26.91 / 24.47 / 24.38 dB |
-| MiniMax-H3 T2VA, 768p | 10% / 18% / 12.5% | 1.25× / 1.16× / 1.08× | 17.90 / 17.81 / 18.11 dB |
+Complete video generation with 50 denoising steps; all methods keep the first 10 steps dense. EchoSparse computes 10%
+of KV blocks; Sol-Attn uses its paper's exact threshold estimator with τ = 1.0 and computes 15–18%; PISA computes
+12.5% with covariance-aware selection. PSNR is against FA4, averaged over 10–25 prompts per model.
 
 EchoSparse has the highest speedup on all four models. Its PSNR gains over Sol-Attn are 1.10 dB on Wan2.1-14B,
 1.19 dB on Wan2.1-1.3B, and 2.44 dB on HunyuanVideo. On MiniMax-H3, the differences are +0.09 dB relative to
@@ -60,23 +71,6 @@ With Sol-Engine's diagonal threshold estimator, Sol-Attn computes 21–25% of KV
 its PSNR is 22.34, 23.39, 25.47, and 18.70 dB, with speedups over FA4 of 1.24×, 1.17×, 1.27×, and 1.10×.
 EchoSparse matches its quality on Wan, gains 1.44 dB on HunyuanVideo, and gives 0.8 dB lower PSNR on H3,
 while running 1.12–1.54× faster.
-
-### RTX 5090
-
-Complete generations with this package and the scripts in `examples/`: 50 denoising steps, one prompt per model
-with the seed of the B200 evaluation, EchoSparse and dense FA4 each run once. The weights of Wan2.1-14B,
-HunyuanVideo and MiniMax-H3 stay in CPU memory and are copied to the GPU group by group (`--offload`); Wan2.1-1.3B
-sits on the GPU. One forward is the median over the dense steps and over the sparse steps of a run.
-
-| Model | One forward: FA4 / EchoSparse | Whole video: FA4 / EchoSparse | PSNR (B200, same prompt) |
-|---|---|---|---|
-| Wan2.1-14B, 720p | 58.5 s / 36.4 s (1.61×) | — | 22.50 (21.40) dB |
-| Wan2.1-1.3B, 480p | 1.63 s / 0.86 s (1.90×) | 169 s / 119 s (1.42×) | 22.85 (22.67) dB |
-| HunyuanVideo, 720p | 63.5 s / 21.0 s (3.02×) | 3273 s / 1648 s (1.99×) | 31.18 (26.88) dB |
-| MiniMax-H3, 768p, density 0.24 | 18.6 s / 11.7 s (1.59×) | 1475 s / 1235 s (1.19×) | 19.58 (17.11) dB |
-
-The Wan2.1-14B FA4 run shared host memory bandwidth with a run on a second GPU, so no whole-video times are listed
-for it. Sol-Attn was not run with this package on the RTX 5090.
 
 ## TODO List
 

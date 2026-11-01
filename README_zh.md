@@ -32,40 +32,36 @@ Triton 编写，使用普通的 tensor core 点积。两者计算的量和精度
 
 ## 结果
 
+### RTX 5090
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/results-rtx5090-dark.png">
+  <img alt="RTX 5090：EchoSparse 相对 FlashAttention-4 的加速（整段视频和单次稀疏步前向）以及对 FA4 的 PSNR，并列 B200 上同一提示词的 PSNR" src="assets/results-rtx5090.png">
+</picture>
+
+用本包和 `examples/` 里的脚本做完整的 50 步生成，每个模型 1 个提示词，种子与 B200 评测相同；EchoSparse 和 FA4 稠密
+各在一张 GPU 上跑一遍。Wan2.1-14B、HunyuanVideo、MiniMax-H3 的权重放在 CPU 内存里，按组拷到 GPU（`--offload`）；
+Wan2.1-1.3B 直接放在 GPU 上。单次前向取同一次运行中稀疏步（EchoSparse）和稠密步（FA4）各自的中位数。MiniMax-H3 用
+密度 0.24（`minimax_h3_rtx5090`）。RTX 5090 上没有测 Sol-Attn 和 PISA。
+
 ### B200
 
-完整视频生成使用 50 个去噪步，各方法的前 10 步均采用稠密注意力。EchoSparse 精确计算 10% 的 KV 块；
-Sol-Attn 使用论文中的完整阈值估计，τ = 1.0；PISA 按协方差选择 12.5% 的块。PSNR 以 FA4 为参考。
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/results-b200-dark.png">
+  <img alt="B200：四个模型上 EchoSparse、PISA、Sol-Attn 相对 FlashAttention-4 的端到端加速和对 FA4 的 PSNR" src="assets/results-b200.png">
+</picture>
 
-| 模型 | 精确计算的块：本方法 / Sol-Attn / PISA | 相对 FA4 加速：本方法 / Sol-Attn / PISA | PSNR：本方法 / Sol-Attn / PISA |
-|---|---|---|---|
-| Wan2.1-14B，720p | 10% / 15% / 12.5% | 1.70× / 1.43× / 1.42× | 22.54 / 21.44 / 21.00 dB |
-| Wan2.1-1.3B，480p | 10% / 16% / 12.5% | 1.41× / 1.31× / 1.18× | 23.76 / 22.57 / 23.52 dB |
-| HunyuanVideo-13B，720p | 10% / 16% / 12.5% | 1.95× / 1.38× / 1.42× | 26.91 / 24.47 / 24.38 dB |
-| MiniMax-H3 T2VA，768p | 10% / 18% / 12.5% | 1.25× / 1.16× / 1.08× | 17.90 / 17.81 / 18.11 dB |
+完整视频生成使用 50 个去噪步，各方法的前 10 步均采用稠密注意力。EchoSparse 精确计算 10% 的 KV 块；Sol-Attn 使用论文中
+的完整阈值估计，τ = 1.0，实际计算 15–18% 的块；PISA 按协方差选择 12.5% 的块。PSNR 以 FA4 为参考，每个模型取 10–25 个
+提示词的平均。
 
 EchoSparse 在四个模型上均取得最高加速比。相对 Sol-Attn，PSNR 在 Wan2.1-14B 上高 1.10 dB，
 在 Wan2.1-1.3B 上高 1.19 dB，在 HunyuanVideo 上高 2.44 dB。MiniMax-H3 相对 Sol-Attn 和 PISA 的差异分别为
 +0.09 dB 和 −0.21 dB；音频 SNR 分别为 EchoSparse 4.9 dB、Sol-Attn 5.4 dB。
 
-Sol-Engine 的对角阈值估计会计算 21–25% 的 KV 块。按上表模型顺序，Sol-Attn 的 PSNR 为 22.34、23.39、25.47、
+Sol-Engine 的对角阈值估计会计算 21–25% 的 KV 块。按上图的模型顺序，Sol-Attn 的 PSNR 为 22.34、23.39、25.47、
 18.70 dB，相对 FA4 的加速比分别为 1.24×、1.17×、1.27×、1.10×。EchoSparse 在 Wan 上画质相当，在 HunyuanVideo 上
 高 1.44 dB，在 H3 上低 0.8 dB，速度快 1.12–1.54 倍。
-
-### RTX 5090
-
-用本包和 `examples/` 里的脚本做完整生成：50 个去噪步，每个模型 1 个提示词，种子与 B200 评测相同，EchoSparse 和
-FA4 稠密各跑一遍。Wan2.1-14B、HunyuanVideo、MiniMax-H3 的权重放在 CPU 内存里，按组拷到 GPU（`--offload`）；
-Wan2.1-1.3B 直接放在 GPU 上。单次前向取同一次运行中稠密步和稀疏步各自的中位数。
-
-| 模型 | 单次前向：FA4 / EchoSparse | 整段视频：FA4 / EchoSparse | PSNR（B200 同一提示词） |
-|---|---|---|---|
-| Wan2.1-14B，720p | 58.5 s / 36.4 s（1.61×） | — | 22.50（21.40）dB |
-| Wan2.1-1.3B，480p | 1.63 s / 0.86 s（1.90×） | 169 s / 119 s（1.42×） | 22.85（22.67）dB |
-| HunyuanVideo，720p | 63.5 s / 21.0 s（3.02×） | 3273 s / 1648 s（1.99×） | 31.18（26.88）dB |
-| MiniMax-H3，768p，密度 0.24 | 18.6 s / 11.7 s（1.59×） | 1475 s / 1235 s（1.19×） | 19.58（17.11）dB |
-
-Wan2.1-14B 的 FA4 运行与另一张 GPU 上的运行共用主机内存带宽，所以不列整段时间。RTX 5090 上没有用本包测 Sol-Attn。
 
 ## 安装
 
