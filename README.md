@@ -78,6 +78,20 @@ sits on the GPU. One forward is the median over the dense steps and over the spa
 The Wan2.1-14B FA4 run shared host memory bandwidth with a run on a second GPU, so no whole-video times are listed
 for it. Sol-Attn was not run with this package on the RTX 5090.
 
+## TODO List
+
+- [ ] Adapt EchoSparse to NVIDIA H100 (SM90).
+- [ ] Adapt EchoSparse to NVIDIA RTX 4090 (SM89).
+- [ ] Add packed representative tokens and develop a producer-consumer architecture using TMA and a
+  three-stage pipeline to reduce fragmented work and memory stalls.
+
+The H100 experimental branch already measures a single-attention GPU pipeline at **163.48 ms with dense FA4,
+71.65 ms with nonpacked EchoSparse, and 44.51 ms with grouped packing, TMA and three pipeline stages**.
+For the same sparse plan and representative tensors, packing introduces no additional approximation and yields
+the same output in real arithmetic.
+These experimental timings use synthetic BF16 QKV `[1,75600,40,128]`, density 0.10 and a frozen sparse plan;
+they measure the GPU attention pipeline, not video generation. Mainline integration and full benchmarks remain open.
+
 ## Installation
 
 Requirements: a B200 (SM100) or RTX 5090 (SM120) GPU, CUDA 12.8 or newer, Python 3.10 or newer.
