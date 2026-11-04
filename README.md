@@ -234,6 +234,38 @@ itself (as the MiniMax-H3 integration does for the prefix), `rows=n` tells the a
 output rows are used; the RTX 5090 and H100 kernels then skip the query tiles past them. `enable` patches diffusers'
 attention dispatch of the model, so use one pipeline per process.
 
+### Native VSA and VSA2
+
+`echosparse.vsa` holds native CUDA forward and backward kernels for two trainable sparse attentions, separate from
+`EchoSparseAttention`: the original [VSA](https://github.com/hao-ai-lab/FastVideo) (`vsa_attention`: 64-token block
+means, K kv blocks per query block, a full `[B, H, L, D]` weight on the coarse branch) and VSA2 (`vsa2_attention`:
+16-token router pools, an exact budget of NB·K block pairs per head, a scalar tanh gate per token). They share one
+extension, which is built only on request (H100 adds the ThunderKittens fine kernels, pinned in `setup.py`):
+
+```bash
+ECHOSPARSE_VSA_BUILD=1 TORCH_CUDA_ARCH_LIST=12.0 pip install -e . --no-build-isolation      # RTX 5090, CUDA 12.8
+git clone https://github.com/HazyResearch/ThunderKittens third_party/ThunderKittens        # H100
+git -C third_party/ThunderKittens checkout 6c27e28c8115d1839d9eeeb530913c184a75fc87
+ECHOSPARSE_VSA_BUILD=1 ECHOSPARSE_VSA_TK=1 TORCH_CUDA_ARCH_LIST=9.0a pip install -e . --no-build-isolation
+```
+
+Both take `[B, H, NB*64, D]` bf16 or fp16 tokens (D = 64 or 128) ordered in 64-token blocks, with `blk_cnt` real
+tokens first in each block. `build_layout` (a video shape, given explicitly) and `sequence_layout` (a 1-D sequence)
+map real tokens to that layout and back; padded slots output zero and receive no gradient:
+
+```python
+from echosparse import vsa
+
+lay = vsa.build_layout((T, H, W), R=16, device="cuda")          # q, k, v, w: [B, heads, T*H*W, D]
+blocked = [vsa.to_blocked(x, lay) for x in (q, k, v, w)]
+out = vsa.from_blocked(vsa.vsa_attention(*blocked[:3], lay.blk_cnt, topk=32, weight=blocked[3]), lay)
+# VSA2: the per-token gate goes through the same layout, [B, heads, T*H*W] -> [B, heads, NB*64]
+q_b, k_b, v_b, gate_b = (vsa.to_blocked(x, lay) for x in (q, k, v, gate))
+out2 = vsa.from_blocked(vsa.vsa2_attention(q_b, k_b, v_b, gate_b, lay.blk_cnt, R=16, topk=32), lay)
+```
+
+`python -m pytest tests/test_vsa.py tests/test_vsa2.py` checks both against PyTorch oracles.
+
 ## License
 
 Apache License 2.0. See [NOTICE](NOTICE) for third-party attributions.

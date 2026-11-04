@@ -1,0 +1,5 @@
+recursive-include csrc/vsa *.cpp *.cu *.cuh *.h
+include tests/vsa_reference.py
+include third_party/ThunderKittens/LICENSE
+graft third_party/ThunderKittens/include
+graft third_party/ThunderKittens/prototype

@@ -7,3 +7,11 @@ The CuTe DSL kernels in echosparse/kernels/ follow the warp-specialized structur
 forward kernel and call its pipeline and utility helpers (flash_attn.cute.pipeline, flash_attn.cute.utils),
 including the polynomial exp2 emulation. FlashAttention-4 is distributed under the BSD 3-Clause License,
 Copyright (c) 2022, the respective contributors, as shown by its AUTHORS file.
+
+csrc/vsa/sm90_tk/fine_tk_h100.cu is adapted from fastvideo-kernel/csrc/attention/block_sparse_h100.cu of FastVideo
+(https://github.com/hao-ai-lab/FastVideo, commit 661d18ba55ddd2fde1802960cf4343a2ca84f57e), Copyright the FastVideo
+authors, licensed under the Apache License, Version 2.0; its changes are listed in the file header. echosparse/vsa
+implements the VSA algorithm of FastVideo's video_sparse_attn at that commit, and its block layout mirrors FastVideo's
+tile ordering. The H100 build compiles against ThunderKittens (https://github.com/HazyResearch/ThunderKittens, commit
+6c27e28c8115d1839d9eeeb530913c184a75fc87), licensed under the MIT License with the copyright notice in its LICENSE
+file; it is not vendored here, and a source distribution built with it includes that file.

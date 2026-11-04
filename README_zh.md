@@ -205,6 +205,38 @@ token 的序列走稠密计算）。`branch` 是一个去噪步内 transformer �
 `rows=n` 告诉注意力只用到前 `n` 行输出；RTX 5090 和 H100 的 kernel 会跳过之后的 query tile。`enable` 会替换 diffusers 中
 该模型的注意力分派函数，所以一个进程里只用一条流水线。
 
+### 原生 VSA 与 VSA2
+
+`echosparse.vsa` 提供两种可训练稀疏注意力的原生 CUDA 前向与反向，与 `EchoSparseAttention` 相互独立：原始
+[VSA](https://github.com/hao-ai-lab/FastVideo)（`vsa_attention`：64 token 块均值，每个 query 块取 K 个 kv 块，粗粒度
+分支乘完整的 `[B, H, L, D]` 权重）和 VSA2（`vsa2_attention`：16 token 路由池化，每个头精确选 NB·K 个块对，每个 token
+一个标量 tanh 门控）。两者共用一个扩展，只在显式要求时编译（H100 另加 ThunderKittens 细粒度 kernel，版本固定在
+`setup.py`）：
+
+```bash
+ECHOSPARSE_VSA_BUILD=1 TORCH_CUDA_ARCH_LIST=12.0 pip install -e . --no-build-isolation      # RTX 5090，CUDA 12.8
+git clone https://github.com/HazyResearch/ThunderKittens third_party/ThunderKittens        # H100
+git -C third_party/ThunderKittens checkout 6c27e28c8115d1839d9eeeb530913c184a75fc87
+ECHOSPARSE_VSA_BUILD=1 ECHOSPARSE_VSA_TK=1 TORCH_CUDA_ARCH_LIST=9.0a pip install -e . --no-build-isolation
+```
+
+两者的输入是按 64 token 块排列的 `[B, H, NB*64, D]` bf16 或 fp16 张量（D 为 64 或 128），每块前 `blk_cnt` 个是真实
+token。`build_layout`（显式给出视频形状）和 `sequence_layout`（一维序列）在真实 token 与该布局之间来回映射；填充位置
+输出为零，也不接收梯度：
+
+```python
+from echosparse import vsa
+
+lay = vsa.build_layout((T, H, W), R=16, device="cuda")          # q, k, v, w: [B, heads, T*H*W, D]
+blocked = [vsa.to_blocked(x, lay) for x in (q, k, v, w)]
+out = vsa.from_blocked(vsa.vsa_attention(*blocked[:3], lay.blk_cnt, topk=32, weight=blocked[3]), lay)
+# VSA2：逐 token 的 gate 经同一布局转换，[B, heads, T*H*W] -> [B, heads, NB*64]
+q_b, k_b, v_b, gate_b = (vsa.to_blocked(x, lay) for x in (q, k, v, gate))
+out2 = vsa.from_blocked(vsa.vsa2_attention(q_b, k_b, v_b, gate_b, lay.blk_cnt, R=16, topk=32), lay)
+```
+
+`python -m pytest tests/test_vsa.py tests/test_vsa2.py` 用 PyTorch 参考实现检查两者。
+
 ## 许可证
 
 Apache License 2.0。第三方来源见 [NOTICE](NOTICE)。

@@ -4,3 +4,5 @@ __pycache__/
 build/
 *.wav
 *.mp4
+third_party/ThunderKittens/
+*.so
