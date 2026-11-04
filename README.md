@@ -18,7 +18,7 @@
 EchoSparse is block-sparse self-attention for video diffusion transformers. The softmax statistics of each
 denoising step echo into the next one: they set its softmax offset, pick the blocks it computes and decide how
 the skipped blocks are compensated. It needs no training and plugs into diffusers pipelines. It runs on NVIDIA
-Blackwell GPUs: B200 (SM100) and RTX 5090 (SM120).
+B200 (SM100), RTX 5090 (SM120) and H100 (SM90) GPUs.
 
 ## News
 
@@ -49,10 +49,19 @@ previous step's LSE of every layer and CFG branch and uses it in three places, a
 The first 10 denoising steps run dense with FlashAttention-4. The last of them sends every block through the
 kernel to build the first probability map.
 
-On the B200 the kernels are written in CuTe DSL with tcgen05 MMAs and tensor memory. The RTX 5090 has neither, so
-its kernels are written in Triton with ordinary tensor-core dots. They compute the same quantities in the same
-precision. To fit in 32 GB, the RTX 5090 keeps per layer only the LSE of each CFG branch and the next step's block
-selection, as bit masks; the probability map is scratch shared by all layers.
+On the B200 the kernels are written in CuTe DSL with tcgen05 MMAs and tensor memory. The RTX 5090 and the H100 have
+neither, so their kernels are written in Triton with ordinary loads and tensor-core dots. They compute the same
+quantities in the same precision. To fit in 32 GB, the RTX 5090 keeps per layer only the LSE of each CFG branch and
+the next step's block selection, as bit masks; the probability map is scratch shared by all layers. The H100 keeps
+the same state.
+
+The Triton kernels take the compensation columns from two short lists per query tile, written when a step's block
+selection is unpacked: the blocks left to their means and the refined blocks. These are the same columns with the
+same weights as a masked pass over every block, without the masked-out work; only the order of summation changes.
+The RTX 5090 kernel computes each 64-token block as two 32-key halves and 32 compensation columns at a time. The H100
+kernel computes whole 64-token blocks with 8 warps, 128 compensation columns at a time, and in sparse steps
+software-pipelines the exact-block loop over three stages so that the K / V gathers overlap the dots; it uses
+ordinary pointer loads, not TMA.
 
 ## Results
 
@@ -68,6 +77,22 @@ the B200 evaluation; EchoSparse and dense FA4 each run once on one GPU. The weig
 MiniMax-H3 stay in CPU memory and are copied to the GPU group by group (`--offload`); Wan2.1-1.3B sits on the GPU.
 One forward is the median over a run's sparse steps (EchoSparse) and dense steps (FA4). MiniMax-H3 runs at density
 0.24 (`minimax_h3_rtx5090`). Sol-Attn and PISA were not run on the RTX 5090.
+
+### H100
+
+Initial end-to-end results for Wan2.1-1.3B on one H100 80 GB: 50 steps, 81 frames at 480×832, seed 0, with all
+weights resident on the GPU. Each method runs once with the same inputs; EchoSparse uses density 0.10 and keeps
+the first 10 steps dense.
+
+| Method | Complete generation / s | PSNR against FA4 / dB |
+| --- | ---: | ---: |
+| Dense FlashAttention-4 | 62.656 | — |
+| Previous H100 EchoSparse (`sm90_wide`) | 49.492 | 24.835 |
+| Grouped128 + exact three-stage pipeline | 47.487 | 24.831 |
+
+The grouped path is 1.319× faster than FA4 and reduces generation time by 4.05% relative to the previous H100
+path. Timing includes the complete pipeline and decode, excluding model loading, warmup, saving and scoring.
+PSNR uses native float32 frames.
 
 ### B200
 
@@ -91,21 +116,14 @@ while running 1.12–1.54× faster.
 
 ## TODO List
 
-- [ ] Adapt EchoSparse to NVIDIA H100 (SM90).
+- [x] Adapt EchoSparse to NVIDIA H100 (SM90).
+- [x] Report initial end-to-end H100 results for Wan2.1-1.3B.
 - [ ] Adapt EchoSparse to NVIDIA RTX 4090 (SM89).
-- [ ] Add packed representative tokens and develop a producer-consumer architecture using TMA and a
-  three-stage pipeline to reduce fragmented work and memory stalls.
-
-The H100 experimental branch already measures a single-attention GPU pipeline at **163.48 ms with dense FA4,
-71.65 ms with nonpacked EchoSparse, and 44.51 ms with grouped packing, TMA and three pipeline stages**.
-For the same sparse plan and representative tensors, packing introduces no additional approximation and yields
-the same output in real arithmetic.
-These experimental timings use synthetic BF16 QKV `[1,75600,40,128]`, density 0.10 and a frozen sparse plan;
-they measure the GPU attention pipeline, not video generation. Mainline integration and full benchmarks remain open.
+- [ ] Develop a producer-consumer architecture using TMA to reduce memory stalls further.
 
 ## Installation
 
-Requirements: a B200 (SM100) or RTX 5090 (SM120) GPU, CUDA 12.8 or newer, Python 3.10 or newer.
+Requirements: a B200 (SM100), RTX 5090 (SM120) or H100 (SM90) GPU, CUDA 12.8 or newer, Python 3.10 or newer.
 
 ```bash
 git clone https://github.com/W2GenAI-Lab/EchoSparse-Attn.git
@@ -178,7 +196,10 @@ The attention state kept between steps occupies about 1.89 GB for Wan2.1-14B (bo
 HunyuanVideo and 0.63 GB for MiniMax-H3 at the resolutions above, plus one shared work buffer. It stays on the GPU
 throughout inference.
 
-To insist on one GPU type, pass `gpu="b200"` or `gpu="rtx5090"`; a call on a different GPU then raises an error.
+### On an H100
+
+To insist on one GPU type, pass `gpu="b200"`, `gpu="rtx5090"` or `gpu="h100"`; a call on a different GPU then
+raises an error.
 
 ### Presets
 
@@ -210,7 +231,7 @@ denoising step (0 for the conditional pass, 1 for the unconditional one); later 
 of branch 0. Tokens that every query should attend to exactly (text, conditioning) go at the end of the sequence,
 with `sink` set to the index of their first 64-token block. If the caller recomputes some trailing query rows
 itself (as the MiniMax-H3 integration does for the prefix), `rows=n` tells the attention that only the first `n`
-output rows are used; the RTX 5090 kernels then skip the query tiles past them. `enable` patches diffusers'
+output rows are used; the RTX 5090 and H100 kernels then skip the query tiles past them. `enable` patches diffusers'
 attention dispatch of the model, so use one pipeline per process.
 
 ## License

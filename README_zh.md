@@ -17,7 +17,7 @@
 
 EchoSparse 是面向视频扩散模型的块稀疏自注意力。每个去噪步的 softmax 统计量会在下一步被再次利用（名字里的
 Echo 即指这一点）：用来设定下一步的 softmax 偏移量、选择要计算的块，并决定跳过的块如何补偿。不需要训练，可以
-直接接入 diffusers 流水线。可在 NVIDIA Blackwell GPU 上运行：B200（SM100）和 RTX 5090（SM120）。
+直接接入 diffusers 流水线。可在 NVIDIA B200（SM100）、RTX 5090（SM120）和 H100（SM90）GPU 上运行。
 
 ## 动态
 
@@ -43,9 +43,14 @@ CFG 分支保存上一步的 LSE，在同一个注意力 kernel 里用到三处�
 
 前 10 个去噪步用 FlashAttention-4 稠密计算。其中最后一步让所有块都经过本 kernel，生成第一张块概率图。
 
-在 B200 上，kernel 用 CuTe DSL 编写，使用 tcgen05 MMA 和 tensor memory。RTX 5090 没有这两者，所以它的 kernel 用
-Triton 编写，使用普通的 tensor core 点积。两者计算的量和精度相同。为了放进 32 GB 显存，RTX 5090 在去噪步之间每层只保留
-各 CFG 分支的 LSE 和下一步的选块（存成位图），块概率图是各层共用的临时空间。
+在 B200 上，kernel 用 CuTe DSL 编写，使用 tcgen05 MMA 和 tensor memory。RTX 5090 和 H100 没有这两者，所以它们的 kernel
+用 Triton 编写，使用普通的访存和 tensor core 点积。它们计算的量和精度相同。为了放进 32 GB 显存，RTX 5090 在去噪步之间每层只保留
+各 CFG 分支的 LSE 和下一步的选块（存成位图），块概率图是各层共用的临时空间；H100 保留相同的状态。
+
+Triton kernel 从每个 query tile 的两个短列表读取补偿列：用平均值代表的块和细化的块，在展开选块时写出。与逐块掩码相比，
+列和权重都相同，只是省去了被掩掉的计算，求和顺序不同。RTX 5090 kernel 把每个 64-token 块分成两个 32-key 的半块计算，
+每次 32 个补偿列；H100 kernel 用 8 个 warp 整块计算 64-token 块，每次 128 个补偿列，并在稀疏步把精确块循环做三级软件流水，
+让 K / V 的读取与点积重叠；它使用普通的指针访存，不使用 TMA。
 
 ## 结果
 
@@ -60,6 +65,20 @@ Triton 编写，使用普通的 tensor core 点积。两者计算的量和精度
 各在一张 GPU 上跑一遍。Wan2.1-14B、HunyuanVideo、MiniMax-H3 的权重放在 CPU 内存里，按组拷到 GPU（`--offload`）；
 Wan2.1-1.3B 直接放在 GPU 上。单次前向取同一次运行中稀疏步（EchoSparse）和稠密步（FA4）各自的中位数。MiniMax-H3 用
 密度 0.24（`minimax_h3_rtx5090`）。RTX 5090 上没有测 Sol-Attn 和 PISA。
+
+### H100
+
+单张 H100 80 GB 上的首轮 Wan2.1-1.3B 端到端结果：50 步、81 帧、480×832、seed 0，全部权重常驻 GPU。
+每条路径用相同输入各运行一次；EchoSparse 密度为 0.10，前 10 步保持稠密。
+
+| 方法 | 完整生成 / 秒 | 对 FA4 的 PSNR / dB |
+| --- | ---: | ---: |
+| 稠密 FlashAttention-4 | 62.656 | — |
+| 旧 H100 EchoSparse（`sm90_wide`） | 49.492 | 24.835 |
+| Grouped128＋exact 三级流水线 | 47.487 | 24.831 |
+
+grouped 路径相对 FA4 加速 1.319 倍，比旧 H100 路径减少 4.05% 的完整生成时间。计时包含完整 pipeline 和解码，
+排除模型加载、预热、保存及评分；PSNR 使用原生 float32 帧。
 
 ### B200
 
@@ -82,7 +101,7 @@ Sol-Engine 的对角阈值估计会计算 21–25% 的 KV 块。按上图的模�
 
 ## 安装
 
-需要 B200（SM100）或 RTX 5090（SM120）GPU、CUDA 12.8 或更新版本、Python 3.10 或更新版本。
+需要 B200（SM100）、RTX 5090（SM120）或 H100（SM90）GPU、CUDA 12.8 或更新版本、Python 3.10 或更新版本。
 
 ```bash
 git clone https://github.com/W2GenAI-Lab/EchoSparse-Attn.git
@@ -153,7 +172,7 @@ CUDA 显存的碎片。
 上述分辨率下，去噪步之间保留的注意力状态：Wan2.1-14B 两个 CFG 分支共约 1.89 GB，HunyuanVideo 约 1.37 GB，
 MiniMax-H3 约 0.63 GB，另需一份共享工作缓冲区。这些状态在推理期间始终保存在 GPU 上。
 
-若要指定 GPU 类型，传入 `gpu="b200"` 或 `gpu="rtx5090"`；在不符的 GPU 上调用时会报错。
+若要指定 GPU 类型，传入 `gpu="b200"`、`gpu="rtx5090"` 或 `gpu="h100"`；在不符的 GPU 上调用时会报错。
 
 ### 预设
 
@@ -183,7 +202,7 @@ out = attn(q, k, v, step=step, branch=branch, layer=layer)
 token 的序列走稠密计算）。`branch` 是一个去噪步内 transformer 前向的序号（条件分支为 0，无条件分支为 1），后面的
 分支复用分支 0 的选块结果。需要被所有 query 精确计算的 token（文本、条件输入）放在序列末尾，并把 `sink` 设为它们
 所在的第一个 64 token 块的序号。如果调用方自己重算末尾的一些 query 行（MiniMax-H3 的集成对前缀就是这样做的），
-`rows=n` 告诉注意力只用到前 `n` 行输出；RTX 5090 的 kernel 会跳过之后的 query tile。`enable` 会替换 diffusers 中
+`rows=n` 告诉注意力只用到前 `n` 行输出；RTX 5090 和 H100 的 kernel 会跳过之后的 query tile。`enable` 会替换 diffusers 中
 该模型的注意力分派函数，所以一个进程里只用一条流水线。
 
 ## 许可证

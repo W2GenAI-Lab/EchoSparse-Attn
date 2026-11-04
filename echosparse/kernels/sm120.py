@@ -3,7 +3,9 @@
 SM120 has no tcgen05 MMAs or tensor memory, so the attention kernel is written with ordinary loads and tensor-core
 dots. It computes the same quantities as the B200 kernels, in the same units: 128-row query tiles, 64-token kv
 blocks, the previous step's log2 LSE as a fixed softmax offset, block masses summed over the tile's rows, BF16
-operands and FP32 accumulation.
+operands and FP32 accumulation. The compensation columns come from compact per-tile lists that the plan rebuild
+writes: the block ids left to their means (32 per batch) and the refined block ids (8 per batch, 32 representative
+columns).
 
 The selection, compensation and Gram / Cholesky / probe kernels are shared with the B200 set.
 """
@@ -22,12 +24,12 @@ LOG2E = 1.4426950408889634
 
 
 @triton.jit
-def _attention_kernel(Q, K, V, KB, VB, BITS, O, CNT, IDX, PRIOR, LSE, FLAG, MASS, RIDX, K4, V4, LC4, L, NB, NREF,
-                      NK: tl.constexpr, NW: tl.constexpr, RW: tl.constexpr, NQ: tl.constexpr, H: tl.constexpr,
-                      D: tl.constexpr, BM: tl.constexpr, SCALE: tl.constexpr, TH: tl.constexpr,
-                      LAST_LOG2: tl.constexpr, COMP: tl.constexpr, REFINE: tl.constexpr, WRITE_MASS: tl.constexpr):
-    # The listed 64-token blocks exactly, as two 32-key halves; with COMP every other skipped block through its mean
-    # key and value, with REFINE the refined blocks through four representatives each, 32 columns at a time.
+def _attention_kernel(Q, K, V, KB, VB, O, CNT, IDX, PRIOR, LSE, FLAG, MASS, MIDX, MCNT, RIDX, RCNT, K4, V4, LC4, L,
+                      NB, NK: tl.constexpr, RW: tl.constexpr, NQ: tl.constexpr, H: tl.constexpr, D: tl.constexpr,
+                      BM: tl.constexpr, SCALE: tl.constexpr, TH: tl.constexpr, LAST_LOG2: tl.constexpr,
+                      COMP: tl.constexpr, WRITE_MASS: tl.constexpr):
+    # The listed 64-token blocks exactly, as two 32-key halves; with COMP the listed mean blocks through their mean
+    # key and value and the listed refined blocks through four representatives each, 32 columns at a time.
     t, h = tl.program_id(0), tl.program_id(1)
     rr = t * BM + tl.arange(0, BM)
     dd = tl.arange(0, D)
@@ -59,29 +61,30 @@ def _attention_kernel(Q, K, V, KB, VB, BITS, O, CNT, IDX, PRIOR, LSE, FLAG, MASS
             block = tl.zeros((BM,), tl.float32)
 
     if COMP:
-        for j0 in range(0, NB, 32):
-            b = j0 + cc
+        nm = tl.load(MCNT + t * H + h)
+        for c0 in range(0, nm, 32):
+            colv = c0 + cc < nm
+            b = tl.load(MIDX + (t * H + h) * NK + c0 + cc, mask=colv, other=NB)
             bo = (b[:, None] * H + h) * D + dd[None, :]
-            kb = tl.load(KB + bo, mask=(b < NB)[:, None], other=0)
-            vb = tl.load(VB + bo, mask=(b < NB)[:, None], other=0)
-            word = tl.load(BITS + (h * NQ + t) * NW + b // 32, mask=b < NB, other=-1)
-            skip = ((word >> (b % 32)) & 1) != 0
+            kb = tl.load(KB + bo, mask=colv[:, None] & (b < NB)[:, None], other=0)
+            vb = tl.load(VB + bo, mask=colv[:, None] & (b < NB)[:, None], other=0)
             count_log = tl.where(b == NB - 1, LAST_LOG2, 6.0)
             s = tl.dot(q, tl.trans(kb)) * SCALE + count_log[None, :] - prior[:, None]
-            s = tl.where(valid[:, None] & (b < NB)[None, :] & (~skip)[None, :], s, -float('inf'))
+            s = tl.where(valid[:, None] & colv[None, :], s, -float('inf'))
             p = tl.exp2(s)
             total += tl.sum(p, 1)
             acc = tl.dot(p.to(tl.bfloat16), vb, acc)
-    if REFINE:
-        for r0 in range(0, NREF, 8):
-            b = tl.load(RIDX + (t * H + h) * RW + r0 + cc // 4)
+        nr = tl.load(RCNT + t * H + h)
+        for r0 in range(0, nr, 8):
+            colv = r0 + cc // 4 < nr
+            b = tl.load(RIDX + (t * H + h) * RW + r0 + cc // 4, mask=colv, other=NB)
             c = b * 4 + cc % 4
             co = (h * ((NB + 1) * 4) + c[:, None]) * D + dd[None, :]
-            kc = tl.load(K4 + co)
-            vc = tl.load(V4 + co)
-            lc = tl.load(LC4 + h * ((NB + 1) * 4) + c)
+            kc = tl.load(K4 + co, mask=colv[:, None], other=0)
+            vc = tl.load(V4 + co, mask=colv[:, None], other=0)
+            lc = tl.load(LC4 + h * ((NB + 1) * 4) + c, mask=colv, other=-float('inf'))
             s = tl.dot(q, tl.trans(kc)) * SCALE + lc[None, :] - prior[:, None]
-            s = tl.where(valid[:, None], s, -float('inf'))
+            s = tl.where(valid[:, None] & colv[None, :], s, -float('inf'))
             p = tl.exp2(s)
             total += tl.sum(p, 1)
             acc = tl.dot(p.to(tl.bfloat16), vc, acc)
@@ -98,39 +101,43 @@ def block_attention(q, k, v, out, counts, blocks, offset, lse, flags, mass=None,
     L, H, D = q.shape
     assert D == 128 and q.dtype == torch.bfloat16
     nq = triton.cdiv(L, BM)
-    _attention_kernel[(nq, H)](q, k, v, q, v, blocks, out, counts, blocks, offset, lse, flags,
-                               offset if mass is None else mass, blocks, q, v, offset, L, triton.cdiv(L, BK), 0,
-                               NK=blocks.shape[-1], NW=0, RW=0, NQ=nq, H=H, D=D, BM=BM, SCALE=LOG2E / math.sqrt(D),
-                               TH=float(threshold), LAST_LOG2=0.0, COMP=False, REFINE=False,
+    _attention_kernel[(nq, H)](q, k, v, q, v, out, counts, blocks, offset, lse, flags,
+                               offset if mass is None else mass, blocks, counts, blocks, counts, q, v, offset, L,
+                               triton.cdiv(L, BK), NK=blocks.shape[-1], RW=0, NQ=nq, H=H, D=D, BM=BM,
+                               SCALE=LOG2E / math.sqrt(D), TH=float(threshold), LAST_LOG2=0.0, COMP=False,
                                WRITE_MASS=mass is not None, num_warps=4, num_stages=2)
 
 
-def sparse_attention(q, k, v, k_mean, v_mean, skip_bits, out, counts, blocks, offset, lse, flags, refine, k_rep,
-                     v_rep, log_counts, mass=None, threshold=60.0, rows=None, refined=None):
-    """Listed blocks exactly, the other skipped blocks through block means and the refined blocks through four
-    representatives each, in one softmax at the fixed offset.
-
-    `rows`: the caller only uses query rows < rows (it overwrites the others), so query tiles past them are not
-    launched; their output is zero, their LSE the offset and their flag 0. `refined`: the number of refine-list
-    entries before the sentinel padding; the padding past it is not computed.
-    """
-    L, H, D = q.shape
-    assert D == 128 and q.dtype == torch.bfloat16
-    nq, nb = triton.cdiv(L, BM), triton.cdiv(L, BK)
-    width = refine.shape[-1]
+def launched_tiles(out, lse, flags, offset, rows):
+    """Query tiles to launch: the caller only uses query rows < rows (it overwrites the others), so the tiles past
+    them are not launched; their output is zero, their LSE the offset and their flag 0."""
+    nq = triton.cdiv(out.shape[0], BM)
     tiles = nq if rows is None else triton.cdiv(rows, BM)
     if tiles < nq:
         flags[tiles:].zero_()
         out[tiles * BM:].zero_()
         lse[tiles * BM:].copy_(offset[tiles * BM:])
-    nref = width if refined is None else min(width, triton.cdiv(refined, 8) * 8)
-    _attention_kernel[(tiles, H)](q, k, v, k_mean, v_mean, skip_bits, out, counts, blocks, offset, lse, flags,
-                                  offset if mass is None else mass, refine if width else blocks,
-                                  k_rep if width else q, v_rep if width else v, log_counts if width else offset, L,
-                                  nb, nref, NK=blocks.shape[-1], NW=skip_bits.shape[-1], RW=width, NQ=nq, H=H, D=D,
-                                  BM=BM, SCALE=LOG2E / math.sqrt(D), TH=float(threshold),
-                                  LAST_LOG2=math.log2(L - (nb - 1) * BK), COMP=True, REFINE=width > 0,
-                                  WRITE_MASS=mass is not None, num_warps=4, num_stages=2)
+    return tiles
+
+
+def sparse_attention(q, k, v, k_mean, v_mean, means, mean_counts, out, counts, blocks, offset, lse, flags, refine,
+                     refine_counts, k_rep, v_rep, log_counts, mass=None, threshold=60.0, rows=None):
+    """Listed blocks exactly, the listed mean blocks through block means and the listed refined blocks through four
+    representatives each, in one softmax at the fixed offset. The lists are `rebuild_plan`'s; `rows`: see
+    `launched_tiles`.
+    """
+    L, H, D = q.shape
+    assert D == 128 and q.dtype == torch.bfloat16
+    nq, nb = triton.cdiv(L, BM), triton.cdiv(L, BK)
+    tiles = launched_tiles(out, lse, flags, offset, rows)
+    if tiles == 0:
+        return
+    _attention_kernel[(tiles, H)](q, k, v, k_mean, v_mean, out, counts, blocks, offset, lse, flags,
+                                  offset if mass is None else mass, means, mean_counts, refine, refine_counts,
+                                  k_rep, v_rep, log_counts, L, nb, NK=blocks.shape[-1], RW=refine.shape[-1], NQ=nq,
+                                  H=H, D=D, BM=BM, SCALE=LOG2E / math.sqrt(D), TH=float(threshold),
+                                  LAST_LOG2=math.log2(L - (nb - 1) * BK), COMP=True, WRITE_MASS=mass is not None,
+                                  num_warps=4, num_stages=2)
 
 
 @triton.jit
@@ -245,8 +252,8 @@ def estimate_skipped(q, k_mean, keep, offset, lse, mass, scale_exact, scale_skip
 
 # Plans: the selection for the next step is made right after this step's estimates and kept as two bit masks per
 # (tile, head): the exactly computed blocks, and the blocks the block-mean compensation leaves out (exact and refined;
-# `select_blocks`' skip bits). The keep mask, block list and refine list are rebuilt from them at the next step, so
-# the block-probability map, the lists and the scales are shared scratch instead of per-layer state.
+# `select_blocks`' skip bits). The keep mask and the block, mean and refine lists are rebuilt from them at the next
+# step, so the block-probability map, the lists and the scales are shared scratch instead of per-layer state.
 
 @triton.jit
 def _pack_kernel(KEEP, EXACT, NB: tl.constexpr, NQ: tl.constexpr, NW: tl.constexpr, NBP: tl.constexpr):
@@ -267,13 +274,17 @@ def pack_plan(keep, exact_bits):
 
 
 @triton.jit
-def _rebuild_kernel(EXACT, SKIP, KEEP, CNT, IDX, RIDX, NB: tl.constexpr, NQ: tl.constexpr, H: tl.constexpr,
-                    NW: tl.constexpr, RW: tl.constexpr, NBP: tl.constexpr):
+def _rebuild_kernel(EXACT, SKIP, KEEP, CNT, IDX, RIDX, RCNT, MIDX, MCNT, NB: tl.constexpr, NQ: tl.constexpr,
+                    H: tl.constexpr, NW: tl.constexpr, RW: tl.constexpr, NBP: tl.constexpr):
     t, h = tl.program_id(0), tl.program_id(1)
     j = tl.arange(0, NBP)
     off = (h * NQ + t) * NW + j // 32
     exact = (((tl.load(EXACT + off) >> (j % 32)) & 1) != 0) & (j < NB)
-    refined = (((tl.load(SKIP + off) >> (j % 32)) & 1) != 0) & ~exact & (j < NB)
+    skip = ((tl.load(SKIP + off) >> (j % 32)) & 1) != 0
+    refined = skip & ~exact & (j < NB)
+    mean = ~skip & (j < NB)
+    tl.store(MIDX + (t * H + h) * NB + tl.cumsum(mean.to(tl.int32), 0) - 1, j, mask=mean)
+    tl.store(MCNT + t * H + h, tl.sum(mean.to(tl.int32)))
     pos = tl.cumsum(exact.to(tl.int32), 0) - 1
     tl.store(IDX + (t * H + h) * NB + pos, j, mask=exact)
     tl.store(CNT + t * H + h, tl.sum(exact.to(tl.int32)))
@@ -282,14 +293,16 @@ def _rebuild_kernel(EXACT, SKIP, KEEP, CNT, IDX, RIDX, NB: tl.constexpr, NQ: tl.
     nref = tl.sum(refined.to(tl.int32))
     tl.store(RIDX + (t * H + h) * RW + j, tl.full([NBP], NB, tl.int32), mask=(j >= nref) & (j < RW))
     tl.store(RIDX + (t * H + h) * RW + rpos, j, mask=refined & (rpos < RW))
+    tl.store(RCNT + t * H + h, tl.minimum(nref, RW))
 
 
-def rebuild_plan(exact_bits, skip_bits, keep, counts, blocks, refine):
-    """keep mask, sorted block list and refine list (padded with nb) from the two bit masks of a plan."""
+def rebuild_plan(exact_bits, skip_bits, keep, counts, blocks, refine, refine_counts, means, mean_counts):
+    """keep mask, sorted block list, refine list (padded with nb) and sorted list of the blocks left to their means
+    (`means`, shaped as `blocks`), with the lengths of the last two, from the two bit masks of a plan."""
     H, nq, nb = keep.shape
-    _rebuild_kernel[(nq, H)](exact_bits, skip_bits, keep, counts, blocks, refine, NB=nb, NQ=nq, H=H,
-                             NW=exact_bits.shape[-1], RW=refine.shape[-1], NBP=triton.next_power_of_2(nb),
-                             num_warps=4 if nb <= 1024 else 8)
+    _rebuild_kernel[(nq, H)](exact_bits, skip_bits, keep, counts, blocks, refine, refine_counts, means, mean_counts,
+                             NB=nb, NQ=nq, H=H, NW=exact_bits.shape[-1], RW=refine.shape[-1],
+                             NBP=triton.next_power_of_2(nb), num_warps=4 if nb <= 1024 else 8)
 
 
 @triton.jit

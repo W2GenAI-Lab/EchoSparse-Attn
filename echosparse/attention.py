@@ -13,11 +13,11 @@ Schedule of a (branch, layer): FA4 for the first `dense_steps - 1` steps, then o
 the fixed-offset kernel (exact output and the first block-probability map), then sparse steps that compute the
 top `density` blocks of every 128-row query tile.
 
-The kernels run on B200 (SM100) and RTX 5090 (SM120) GPUs; `backends` picks them from the device of q. The two keep
-different state between steps; the computation is the same. The B200 keeps, for every (branch, layer), the
+The kernels run on H100 (SM90), B200 (SM100) and RTX 5090 (SM120) GPUs; `backends` picks them from the device of q.
+They keep different state between steps; the computation is the same. The B200 keeps, for every (branch, layer), the
 block-probability map, the block lists and the scales, and selects a step's blocks at its start. The RTX 5090
-(32 GB) keeps per layer only the offsets of each branch and the next step's selection as two bit masks per tile,
-made at the end of each step; the map, the lists and the scales are scratch shared by all layers.
+(32 GB) and the H100 keep per layer only the offsets of each branch and the next step's selection as two bit masks
+per tile, made at the end of each step; the map, the lists and the scales are scratch shared by all layers.
 """
 import torch
 import triton
@@ -70,9 +70,9 @@ class _LayerState:
 
 
 class _CompactState:
-    """RTX 5090 state of one layer: the offsets of every branch and the plans (exact and skip bit masks). One branch
-    rewrites its plan in place once the step has used it; with CFG branch 0 writes the other of two plans while later
-    branches still read the current one."""
+    """RTX 5090 / H100 state of one layer: the offsets of every branch and the plans (exact and skip bit masks). One
+    branch rewrites its plan in place once the step has used it; with CFG branch 0 writes the other of two plans while
+    later branches still read the current one."""
 
     def __init__(self, L, H, device):
         nb = triton.cdiv(L, BK)
@@ -97,7 +97,7 @@ class _CompactState:
 
 
 class _PlanScratch:
-    """Per-call tensors of the RTX 5090 path, shared by all layers."""
+    """Per-call tensors of the RTX 5090 / H100 path, shared by all layers."""
 
     def __init__(self, L, H, device, refine_width):
         nq, nb = triton.cdiv(L, BM), triton.cdiv(L, BK)
@@ -110,6 +110,9 @@ class _PlanScratch:
         self.counts = torch.empty(nq, H, device=device, dtype=torch.int32)
         self.blocks = torch.zeros(nq, H, nb, device=device, dtype=torch.int32)
         self.refine = torch.empty(nq, H, refine_width, device=device, dtype=torch.int32)
+        self.refine_counts = torch.empty(nq, H, device=device, dtype=torch.int32)
+        self.means = torch.empty(nq, H, nb, device=device, dtype=torch.int32)
+        self.mean_counts = torch.empty(nq, H, device=device, dtype=torch.int32)
         self.next_offset = torch.empty(nq * BM, H, device=device)
 
 
@@ -134,9 +137,9 @@ class EchoSparseAttention:
     forwards of a denoising step (0: conditional, 1: unconditional); later branches reuse branch 0's block
     selection of the same step and layer. `sink`: first kv block that every query tile computes exactly (text or
     other conditioning tokens placed after the video tokens). `rows`: the caller uses only the first `rows` output
-    rows and overwrites the others; the RTX 5090 kernels then skip the query tiles past them.
+    rows and overwrites the others; the RTX 5090 / H100 kernels then skip the query tiles past them.
 
-    `gpu`: "auto" (from the device of q), "b200" or "rtx5090"; see `echosparse.backends`.
+    `gpu`: "auto" (from the device of q), "h100", "b200" or "rtx5090"; see `echosparse.backends`.
     """
 
     def __init__(self, density=0.10, dense_steps=10, dense_layers=(0,), refine_iters=6, threshold=60.0, gpu="auto"):
@@ -174,9 +177,9 @@ class EchoSparseAttention:
             self._device = q.device
         if layer in self.dense_layers or triton.cdiv(L, BK) < MIN_BLOCKS:
             return dense_attention(q, k, v)
-        if self.backend == "rtx5090":
-            return self._call_rtx5090(q, k, v, step, branch, layer, sink, rows)
-        return self._call_b200(q, k, v, step, branch, layer, sink)
+        if self.backend == "b200":
+            return self._call_b200(q, k, v, step, branch, layer, sink)
+        return self._call_compact(q, k, v, step, branch, layer, sink, rows)
 
     def _call_b200(self, q, k, v, step, branch, layer, sink):
         L, H, D = q[0].shape
@@ -266,7 +269,7 @@ class EchoSparseAttention:
         top = max(1, int(round(self.density * nb)))
         return top, max(0, int(round((nb - top) / 3)))
 
-    def _call_rtx5090(self, q, k, v, step, branch, layer, sink, rows):
+    def _call_compact(self, q, k, v, step, branch, layer, sink, rows):
         L, H, D = q[0].shape
         st = self._states.get(layer)
         if st is None or st.L != L:
@@ -301,14 +304,15 @@ class EchoSparseAttention:
             st.ready.add(branch)
         else:
             exact, skip = st.plan(st.current[0])
-            K.rebuild_plan(exact, skip, ps.keep, ps.counts, ps.blocks, ps.refine)
+            K.rebuild_plan(exact, skip, ps.keep, ps.counts, ps.blocks, ps.refine, ps.refine_counts, ps.means,
+                           ps.mean_counts)
             buf.reps.build(q, k, v, buf.k_mean, buf.v_mean)
             if branch == 0:
                 ps.mass.zero_()
-            K.sparse_attention(q, k, v, buf.k_mean, buf.v_mean, skip, out, ps.counts, ps.blocks, offset,
-                               ps.next_offset, buf.flags, ps.refine, buf.reps.k, buf.reps.v, buf.reps.log_counts,
-                               mass=ps.mass if branch == 0 else None, threshold=self.threshold, rows=rows,
-                               refined=refined)
+            K.sparse_attention(q, k, v, buf.k_mean, buf.v_mean, ps.means, ps.mean_counts, out, ps.counts, ps.blocks,
+                               offset, ps.next_offset, buf.flags, ps.refine, ps.refine_counts, buf.reps.k, buf.reps.v,
+                               buf.reps.log_counts, mass=ps.mass if branch == 0 else None, threshold=self.threshold,
+                               rows=rows)
             K.exact_fallback(q, k, v, out, ps.counts, ps.blocks, ps.next_offset, buf.flags)
             K.compensate_fallback(q, buf.k_mean, buf.v_mean, ps.keep, ps.next_offset, out, buf.flags)
             if branch == 0:

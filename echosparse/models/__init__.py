@@ -34,8 +34,8 @@ def enable(pipe, preset=None, gpu="auto", **overrides):
     """Route the pipeline's self-attention through EchoSparse attention; returns the attention object.
 
     `preset` names an entry of PRESETS (default: the model's own); `overrides` replace its values (density,
-    dense_steps, dense_layers, refine_iters). `gpu` ("auto", "b200" or "rtx5090") selects the kernels; with "auto" they
-    follow the device the attention runs on, so CPU offloading works."""
+    dense_steps, dense_layers, refine_iters). `gpu` ("auto", "h100", "b200" or "rtx5090") selects the kernels; with
+    "auto" they follow the device the attention runs on, so CPU offloading works."""
     family = model_family(pipe)
     attention = EchoSparseAttention(**settings(family, preset, **overrides), gpu=gpu)
     if family == "wan":

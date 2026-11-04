@@ -27,8 +27,8 @@ def same(a, b):
 
 
 def sparse_inputs(L, H, density=0.1, sink=None, rows=None):
-    """q / k / v of the first sparse step and what that step's kernel reads: the plan's block lists, the block
-    means, the representatives and the offset."""
+    """q / k / v of the first sparse step and what that step's kernel reads: the plan's block, mean and refine
+    lists, the block means, the representatives and the offset."""
     attn = EchoSparseAttention(density=density, dense_steps=2, dense_layers=())
     steps = inputs(L, H, 3)
     for step in range(2):
@@ -42,20 +42,23 @@ def sparse_inputs(L, H, density=0.1, sink=None, rows=None):
     counts = torch.empty(nq, H, device="cuda", dtype=torch.int32)
     blocks = torch.zeros(nq, H, nb, device="cuda", dtype=torch.int32)
     refine = torch.empty(nq, H, triton.cdiv(refined, 32) * 32, device="cuda", dtype=torch.int32)
-    sm120.rebuild_plan(exact, skip, keep, counts, blocks, refine)
+    refine_counts, means, mean_counts = torch.empty_like(counts), torch.empty_like(blocks), torch.empty_like(counts)
+    sm120.rebuild_plan(exact, skip, keep, counts, blocks, refine, refine_counts, means, mean_counts)
     buf.reps.build(q, k, v, buf.k_mean, buf.v_mean)
-    return SimpleNamespace(q=q, k=k, v=v, keep=keep, counts=counts, blocks=blocks, refine=refine, skip=skip,
-                           refined=refined, offset=st.offset(0), buf=buf)
+    return SimpleNamespace(q=q, k=k, v=v, keep=keep, counts=counts, blocks=blocks, refine=refine,
+                           refine_counts=refine_counts, means=means, mean_counts=mean_counts, offset=st.offset(0),
+                           buf=buf)
 
 
-def run_kernel(x, rows=None, refined=None):
+def run_kernel(x, rows=None):
     nq, nb, H = triton.cdiv(x.q.shape[0], 128), x.buf.k_mean.shape[0], x.q.shape[1]
     out, lse = torch.full_like(x.q, 7.0), torch.full_like(x.offset, 7.0)
     flags = torch.full((nq, H), 7, device="cuda", dtype=torch.int32)
     mass = torch.zeros(H, nq, nb, device="cuda")
     reps = x.buf.reps
-    sm120.sparse_attention(x.q, x.k, x.v, x.buf.k_mean, x.buf.v_mean, x.skip, out, x.counts, x.blocks, x.offset, lse,
-                           flags, x.refine, reps.k, reps.v, reps.log_counts, mass=mass, rows=rows, refined=refined)
+    sm120.sparse_attention(x.q, x.k, x.v, x.buf.k_mean, x.buf.v_mean, x.means, x.mean_counts, out, x.counts,
+                           x.blocks, x.offset, lse, flags, x.refine, x.refine_counts, reps.k, reps.v, reps.log_counts,
+                           mass=mass, rows=rows)
     return out, lse, flags, mass
 
 
@@ -94,24 +97,13 @@ def test_estimate_matches_shared_kernel():
 def test_rows_skip_only_unused_tiles():
     L = 4152
     x = sparse_inputs(L, 2, sink=60)
-    full = run_kernel(x, rows=L)                  # every tile, complete lists
+    full = run_kernel(x, rows=L)                  # every tile
     rows = 4000                                   # 32 tiles; tile 31 holds rows 3968-4095 and is computed whole
-    part = run_kernel(x, rows=rows, refined=x.refined)
+    part = run_kernel(x, rows=rows)
     assert same(part[0][:3968 + 128], full[0][:3968 + 128]) and same(part[1][:4096], full[1][:4096])
     assert same(part[2][:32], full[2][:32]) and same(part[3][:, :32], full[3][:, :32])
     assert part[0][4096:].abs().max() == 0 and same(part[1][4096:], x.offset[4096:])
     assert (part[2][32:] == 0).all()
-
-
-@pytest.mark.parametrize("density, refined", [(0.24, 151), (0.20, 159)])
-def test_padding_is_not_computed(density, refined):
-    """MiniMax-H3 shape: 37296 video rows, then 951 prefix rows that the caller overwrites (598 kv blocks)."""
-    L, H, nv = 38247, 2, 37296
-    x = sparse_inputs(L, H, density=density, sink=nv // 64, rows=nv)
-    assert (x.refined, x.refine.shape[-1]) == (refined, 160)
-    skipped = run_kernel(x, rows=nv, refined=x.refined)
-    complete = run_kernel(x, rows=nv)             # the whole refine list
-    assert all(same(a, b) for a, b in zip(skipped, complete))
 
 
 def test_plan_bit_masks_rebuild_the_selection():
@@ -132,11 +124,20 @@ def test_plan_bit_masks_rebuild_the_selection():
                              sink=60)
     exact = torch.empty_like(skip)
     sm120.pack_plan(keep, exact)
-    keep2, counts2, blocks2, refine2 = (torch.full_like(x, 7) for x in (keep, counts, blocks, refine))
-    sm120.rebuild_plan(exact, skip, keep2, counts2, blocks2, refine2)
+    keep2, counts2, blocks2, refine2, refine_counts, means, mean_counts = (
+        torch.full_like(x, 7) for x in (keep, counts, blocks, refine, counts, blocks, counts))
+    sm120.rebuild_plan(exact, skip, keep2, counts2, blocks2, refine2, refine_counts, means, mean_counts)
     used = torch.arange(nb, device="cuda") < counts[..., None]
     assert same(keep2, keep) and same(counts2, counts) and same(refine2, refine)
     assert torch.equal(blocks2[used], blocks[used])
+    assert torch.equal(refine_counts, (refine < nb).sum(-1, dtype=torch.int32))
+    # the mean list: the blocks that are neither exact nor refined, ascending
+    bits = (skip.permute(1, 0, 2)[..., :, None] >> torch.arange(32, device="cuda")) & 1
+    mean = bits.flatten(-2)[..., :nb] == 0
+    assert torch.equal(mean_counts, mean.sum(-1, dtype=torch.int32))
+    ids = torch.arange(nb, device="cuda").expand_as(mean)
+    listed = torch.arange(nb, device="cuda") < mean_counts[..., None]
+    assert torch.equal(means[listed], ids[mean])
 
 
 def persistent_bytes(st):

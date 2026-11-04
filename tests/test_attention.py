@@ -1,4 +1,5 @@
-"""Correctness of the public attention on a B200 (SM100) or RTX 5090 (SM120) GPU: python -m pytest tests"""
+"""Correctness of the public attention on an H100 (SM90), B200 (SM100) or RTX 5090 (SM120) GPU:
+python -m pytest tests"""
 import math
 
 import pytest
@@ -9,8 +10,9 @@ from echosparse import EchoSparseAttention
 from echosparse.attention import dense_attention
 from echosparse.models.common import grid_morton_order
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
-                                reason="needs an SM100 or SM120 GPU")
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available()
+                                or torch.cuda.get_device_capability()[0] not in (9, 10, 12),
+                                reason="needs an SM90, SM100 or SM120 GPU")
 
 L, H, D = 4152, 2, 128          # 65 kv blocks (the last has 56 tokens), 33 query tiles (the last has 56 rows)
 
@@ -42,14 +44,14 @@ def run(attn, inputs, branches=1):
 
 def offset_of(attn, branch=0, layer=1):
     """The offset (previous log2 LSE) that the next call of (branch, layer) uses."""
-    if attn.backend == "rtx5090":
-        return attn._states[layer].offset(branch)
-    return attn._states[(branch, layer)].offset
+    if attn.backend == "b200":
+        return attn._states[(branch, layer)].offset
+    return attn._states[layer].offset(branch)
 
 
 def call_with_selection(attn, q, k, v, step, branch=0, layer=1):
     """One sparse call; returns its output and the block selection it used (counts, blocks, refine list)."""
-    if attn.backend != "rtx5090":
+    if attn.backend == "b200":
         out = attn(q, k, v, step, branch, layer=layer)
         st = attn._states[(0, layer)]
         return out, (st.counts.clone(), st.blocks.clone(), st.refine.clone())
@@ -62,7 +64,8 @@ def call_with_selection(attn, q, k, v, step, branch=0, layer=1):
     counts = torch.empty(nq, H, device="cuda", dtype=torch.int32)
     blocks = torch.zeros(nq, H, nb, device="cuda", dtype=torch.int32)
     refine = torch.empty_like(attn._plan_scratch.refine)
-    attn.K.rebuild_plan(exact, skip, keep, counts, blocks, refine)
+    lists = torch.empty_like(counts), torch.empty_like(blocks), torch.empty_like(counts)
+    attn.K.rebuild_plan(exact, skip, keep, counts, blocks, refine, *lists)
     return out, (counts, blocks, refine)
 
 

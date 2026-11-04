@@ -11,7 +11,7 @@ timestep and modality indices), so the model scatters its tokens straight into [
 prefix] and every layer's q / k / v arrive in the attention's order. The modality index vectors keep their element
 order, so the outputs come back in H3's own order. The prefix query rows attend to the keys in their original
 order, as without the layout, and rotary embedding runs as one kernel with the same BF16 rounding. B200 keeps the
-original per-layer token gathers and Diffusers rotary embedding.
+original per-layer token gathers and Diffusers rotary embedding; so does the H100.
 """
 import torch
 from diffusers.models.transformers import transformer_minimax_h3 as th3

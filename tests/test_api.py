@@ -19,6 +19,8 @@ def capability(monkeypatch):
 
 
 def test_auto_follows_the_device(capability):
+    capability(9)
+    assert backends.resolve("auto", "cuda:0") == "h100"
     capability(10)
     assert backends.resolve("auto", "cuda:0") == "b200"
     capability(12)
@@ -30,15 +32,15 @@ def test_mismatch_and_unsupported_devices_fail(capability):
     capability(12)
     with pytest.raises(RuntimeError, match="gpu='b200' needs compute capability 10.x.*use gpu='auto' or gpu='rtx5090'"):
         backends.resolve("b200", "cuda:0")
-    capability(9)
-    with pytest.raises(RuntimeError, match="capability 9.0; EchoSparse supports"):
+    capability(8)
+    with pytest.raises(RuntimeError, match="capability 8.0; EchoSparse supports"):
         backends.resolve("auto", "cuda:0")
     with pytest.raises(RuntimeError, match="no EchoSparse backend supports"):
         backends.resolve("rtx5090", "cuda:0")
     with pytest.raises(ValueError, match="CUDA tensors"):
         backends.resolve("auto", "cpu")
     with pytest.raises(ValueError, match="gpu must be"):
-        backends.resolve("h100", "cuda:0")
+        backends.resolve("a100", "cuda:0")
 
 
 def test_attention_resolves_at_the_first_call():

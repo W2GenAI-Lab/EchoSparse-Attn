@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "echosparse"
 version = "0.1.0"
-description = "LSE-guided block-sparse attention for video diffusion transformers on NVIDIA Blackwell"
+description = "LSE-guided block-sparse attention for video diffusion transformers on NVIDIA Blackwell and Hopper GPUs"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
