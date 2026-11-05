@@ -22,6 +22,9 @@ B200 (SM100), RTX 5090 (SM120) and H100 (SM90) GPUs.
 
 ## News
 
+- **2026-11-05** — Native CUDA [VSA and VSA2](#native-vsa-and-vsa2) in `echosparse.vsa`: forward and backward on H100
+  (SM90) and RTX 5090 (SM120).
+- **2026-11-04** — EchoSparse runs on H100 (SM90): [results](#h100) · [usage](#on-an-h100).
 - **2026-11-01** — The EchoSparse blog post is out: [English](https://w2genai-lab.github.io/blog/EchoSparse/blog.html) · [中文](https://w2genai-lab.github.io/blog/EchoSparse/zh.html).
 
 ## How it works
@@ -118,6 +121,7 @@ while running 1.12–1.54× faster.
 
 - [x] Adapt EchoSparse to NVIDIA H100 (SM90).
 - [x] Report initial end-to-end H100 results for Wan2.1-1.3B.
+- [x] Native CUDA VSA and VSA2, forward and backward, on H100 (SM90) and RTX 5090 (SM120).
 - [ ] Adapt EchoSparse to NVIDIA RTX 4090 (SM89).
 - [ ] Develop a producer-consumer architecture using TMA to reduce memory stalls further.
 
@@ -198,6 +202,26 @@ throughout inference.
 
 ### On an H100
 
+Wan2.1-1.3B at 480×832, the setting of the [H100 results](#h100), runs with every weight on the 80 GB GPU:
+
+```bash
+python examples/wan.py --model Wan-AI/Wan2.1-T2V-1.3B-Diffusers --prompt "A cat surfing at sunset"
+```
+
+In Python, the quick start with the 1.3B settings of `examples/wan.py`:
+
+```python
+model = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+vae = AutoencoderKLWan.from_pretrained(model, subfolder="vae", torch_dtype=torch.float32)
+pipe = WanPipeline.from_pretrained(model, vae=vae, torch_dtype=torch.bfloat16)
+pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=3.0)
+pipe.to("cuda")
+
+echosparse.enable(pipe, gpu="h100")
+video = pipe(prompt="A cat surfing at sunset", height=480, width=832, num_frames=81,
+             guidance_scale=6.0, num_inference_steps=50).frames[0]
+```
+
 To insist on one GPU type, pass `gpu="b200"`, `gpu="rtx5090"` or `gpu="h100"`; a call on a different GPU then
 raises an error.
 
@@ -236,32 +260,47 @@ attention dispatch of the model, so use one pipeline per process.
 
 ### Native VSA and VSA2
 
-`echosparse.vsa` holds native CUDA forward and backward kernels for two trainable sparse attentions, separate from
-`EchoSparseAttention`: the original [VSA](https://github.com/hao-ai-lab/FastVideo) (`vsa_attention`: 64-token block
-means, K kv blocks per query block, a full `[B, H, L, D]` weight on the coarse branch) and VSA2 (`vsa2_attention`:
-16-token router pools, an exact budget of NB·K block pairs per head, a scalar tanh gate per token). They share one
-extension, which is built only on request (H100 adds the ThunderKittens fine kernels, pinned in `setup.py`):
+`echosparse.vsa` holds native CUDA forward and backward kernels for two trainable sparse attentions: the original
+[VSA](https://github.com/hao-ai-lab/FastVideo) (`vsa_attention`: 64-token block means, K kv blocks per query block,
+a full `[B, H, L, D]` weight on the coarse branch) and VSA2 (`vsa2_attention`: 16-token router pools, an exact
+budget of NB·K block pairs per head, a scalar tanh gate per token). They are stateless functions that you call
+yourself; `enable` and `EchoSparseAttention` never use them. Their extension is built only on request.
+
+RTX 5090 (SM120, CUDA 12.8):
 
 ```bash
-ECHOSPARSE_VSA_BUILD=1 TORCH_CUDA_ARCH_LIST=12.0 pip install -e . --no-build-isolation      # RTX 5090, CUDA 12.8
-git clone https://github.com/HazyResearch/ThunderKittens third_party/ThunderKittens        # H100
+ECHOSPARSE_VSA_BUILD=1 TORCH_CUDA_ARCH_LIST=12.0 pip install -e . --no-build-isolation
+```
+
+H100 (SM90), with the ThunderKittens fine kernels at the revision pinned in `setup.py`:
+
+```bash
+git clone https://github.com/HazyResearch/ThunderKittens third_party/ThunderKittens
 git -C third_party/ThunderKittens checkout 6c27e28c8115d1839d9eeeb530913c184a75fc87
 ECHOSPARSE_VSA_BUILD=1 ECHOSPARSE_VSA_TK=1 TORCH_CUDA_ARCH_LIST=9.0a pip install -e . --no-build-isolation
 ```
 
-Both take `[B, H, NB*64, D]` bf16 or fp16 tokens (D = 64 or 128) ordered in 64-token blocks, with `blk_cnt` real
-tokens first in each block. `build_layout` (a video shape, given explicitly) and `sequence_layout` (a 1-D sequence)
-map real tokens to that layout and back; padded slots output zero and receive no gradient:
+Both take bf16 or fp16 `[B, H, NB*64, D]` tokens (D = 64 or 128) in 64-token blocks, `blk_cnt` real tokens first in
+each block. A layout maps real tokens to it with `to_blocked` and back with `from_blocked`, for q, k, v, the VSA
+weight and the VSA2 gate alike; padded slots output zero and receive no gradient. `sequence_layout(n, device)` cuts
+a 1-D sequence into consecutive blocks; for a video in raster order, `build_layout((T, H, W), R=16, device=...)`
+makes each block a 4×4×4 tile and each 16-token router group a sub-cube of it.
 
 ```python
+import torch
 from echosparse import vsa
 
-lay = vsa.build_layout((T, H, W), R=16, device="cuda")          # q, k, v, w: [B, heads, T*H*W, D]
-blocked = [vsa.to_blocked(x, lay) for x in (q, k, v, w)]
-out = vsa.from_blocked(vsa.vsa_attention(*blocked[:3], lay.blk_cnt, topk=32, weight=blocked[3]), lay)
-# VSA2: the per-token gate goes through the same layout, [B, heads, T*H*W] -> [B, heads, NB*64]
-q_b, k_b, v_b, gate_b = (vsa.to_blocked(x, lay) for x in (q, k, v, gate))
-out2 = vsa.from_blocked(vsa.vsa2_attention(q_b, k_b, v_b, gate_b, lay.blk_cnt, R=16, topk=32), lay)
+B, heads, n, D, dev = 1, 4, 4096, 64, "cuda"
+q, k, v = (torch.randn(B, heads, n, D, device=dev, dtype=torch.bfloat16, requires_grad=True) for _ in range(3))
+w = torch.rand(B, heads, n, D, device=dev, dtype=torch.bfloat16, requires_grad=True)     # VSA: full coarse weight
+gate = torch.randn(B, heads, n, device=dev, dtype=torch.bfloat16, requires_grad=True)    # VSA2: scalar gate per token
+
+lay = vsa.sequence_layout(n, dev)             # a video: vsa.build_layout((T, H, W), R=16, device=dev)
+qb, kb, vb, wb, gb = (vsa.to_blocked(x, lay) for x in (q, k, v, w, gate))   # [B, heads, NB*64, ...]
+o_vsa = vsa.from_blocked(vsa.vsa_attention(qb, kb, vb, lay.blk_cnt, topk=16, weight=wb), lay)
+o_vsa2 = vsa.from_blocked(vsa.vsa2_attention(qb, kb, vb, gb, lay.blk_cnt, R=16, topk=16), lay)
+loss = o_vsa.float().square().mean() + o_vsa2.float().square().mean()
+loss.backward()                                                      # one backward through the shared layout
 ```
 
 `python -m pytest tests/test_vsa.py tests/test_vsa2.py` checks both against PyTorch oracles.

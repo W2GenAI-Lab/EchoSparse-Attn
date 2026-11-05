@@ -21,6 +21,9 @@ Echo 即指这一点）：用来设定下一步的 softmax 偏移量、选择要
 
 ## 动态
 
+- **2026-11-05** — `echosparse.vsa` 提供原生 CUDA [VSA 与 VSA2](#原生-vsa-与-vsa2)：在 H100（SM90）和 RTX 5090（SM120）上
+  支持前向与反向。
+- **2026-11-04** — EchoSparse 支持 H100（SM90）：[结果](#h100) · [用法](#在-h100-上)。
 - **2026-11-01** — EchoSparse 技术博客已发布：[中文](https://w2genai-lab.github.io/blog/EchoSparse/zh.html) · [English](https://w2genai-lab.github.io/blog/EchoSparse/blog.html)。
 
 ## 原理
@@ -99,6 +102,14 @@ Sol-Engine 的对角阈值估计会计算 21–25% 的 KV 块。按上图的模�
 18.70 dB，相对 FA4 的加速比分别为 1.24×、1.17×、1.27×、1.10×。EchoSparse 在 Wan 上画质相当，在 HunyuanVideo 上
 高 1.44 dB，在 H3 上低 0.8 dB，速度快 1.12–1.54 倍。
 
+## TODO 列表
+
+- [x] 将 EchoSparse 适配到 NVIDIA H100（SM90）。
+- [x] 给出 Wan2.1-1.3B 在 H100 上的首轮端到端结果。
+- [x] 原生 CUDA VSA 与 VSA2：在 H100（SM90）和 RTX 5090（SM120）上支持前向与反向。
+- [ ] 将 EchoSparse 适配到 NVIDIA RTX 4090（SM89）。
+- [ ] 用 TMA 实现生产者-消费者结构，进一步减少访存停顿。
+
 ## 安装
 
 需要 B200（SM100）、RTX 5090（SM120）或 H100（SM90）GPU、CUDA 12.8 或更新版本、Python 3.10 或更新版本。
@@ -172,6 +183,28 @@ CUDA 显存的碎片。
 上述分辨率下，去噪步之间保留的注意力状态：Wan2.1-14B 两个 CFG 分支共约 1.89 GB，HunyuanVideo 约 1.37 GB，
 MiniMax-H3 约 0.63 GB，另需一份共享工作缓冲区。这些状态在推理期间始终保存在 GPU 上。
 
+### 在 H100 上
+
+Wan2.1-1.3B 在 480×832 下（即 [H100 结果](#h100) 的设置）可将全部权重放在 80 GB GPU 上运行：
+
+```bash
+python examples/wan.py --model Wan-AI/Wan2.1-T2V-1.3B-Diffusers --prompt "A cat surfing at sunset"
+```
+
+在 Python 中，按快速开始的写法换成 `examples/wan.py` 的 1.3B 设置：
+
+```python
+model = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+vae = AutoencoderKLWan.from_pretrained(model, subfolder="vae", torch_dtype=torch.float32)
+pipe = WanPipeline.from_pretrained(model, vae=vae, torch_dtype=torch.bfloat16)
+pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=3.0)
+pipe.to("cuda")
+
+echosparse.enable(pipe, gpu="h100")
+video = pipe(prompt="A cat surfing at sunset", height=480, width=832, num_frames=81,
+             guidance_scale=6.0, num_inference_steps=50).frames[0]
+```
+
 若要指定 GPU 类型，传入 `gpu="b200"`、`gpu="rtx5090"` 或 `gpu="h100"`；在不符的 GPU 上调用时会报错。
 
 ### 预设
@@ -207,32 +240,45 @@ token 的序列走稠密计算）。`branch` 是一个去噪步内 transformer �
 
 ### 原生 VSA 与 VSA2
 
-`echosparse.vsa` 提供两种可训练稀疏注意力的原生 CUDA 前向与反向，与 `EchoSparseAttention` 相互独立：原始
-[VSA](https://github.com/hao-ai-lab/FastVideo)（`vsa_attention`：64 token 块均值，每个 query 块取 K 个 kv 块，粗粒度
-分支乘完整的 `[B, H, L, D]` 权重）和 VSA2（`vsa2_attention`：16 token 路由池化，每个头精确选 NB·K 个块对，每个 token
-一个标量 tanh 门控）。两者共用一个扩展，只在显式要求时编译（H100 另加 ThunderKittens 细粒度 kernel，版本固定在
-`setup.py`）：
+`echosparse.vsa` 提供两种可训练稀疏注意力的原生 CUDA 前向与反向：原始 [VSA](https://github.com/hao-ai-lab/FastVideo)
+（`vsa_attention`：64 token 块均值，每个 query 块取 K 个 kv 块，粗粒度分支乘完整的 `[B, H, L, D]` 权重）和 VSA2
+（`vsa2_attention`：16 token 路由池化，每个头精确选 NB·K 个块对，每个 token 一个标量 tanh 门控）。它们是需要自行
+调用的无状态函数，`enable` 和 `EchoSparseAttention` 不会使用它们。扩展只在显式要求时编译。
+
+RTX 5090（SM120，CUDA 12.8）：
 
 ```bash
-ECHOSPARSE_VSA_BUILD=1 TORCH_CUDA_ARCH_LIST=12.0 pip install -e . --no-build-isolation      # RTX 5090，CUDA 12.8
-git clone https://github.com/HazyResearch/ThunderKittens third_party/ThunderKittens        # H100
+ECHOSPARSE_VSA_BUILD=1 TORCH_CUDA_ARCH_LIST=12.0 pip install -e . --no-build-isolation
+```
+
+H100（SM90），附带 ThunderKittens 细粒度 kernel，版本为 `setup.py` 中固定的提交：
+
+```bash
+git clone https://github.com/HazyResearch/ThunderKittens third_party/ThunderKittens
 git -C third_party/ThunderKittens checkout 6c27e28c8115d1839d9eeeb530913c184a75fc87
 ECHOSPARSE_VSA_BUILD=1 ECHOSPARSE_VSA_TK=1 TORCH_CUDA_ARCH_LIST=9.0a pip install -e . --no-build-isolation
 ```
 
-两者的输入是按 64 token 块排列的 `[B, H, NB*64, D]` bf16 或 fp16 张量（D 为 64 或 128），每块前 `blk_cnt` 个是真实
-token。`build_layout`（显式给出视频形状）和 `sequence_layout`（一维序列）在真实 token 与该布局之间来回映射；填充位置
-输出为零，也不接收梯度：
+两者的输入是按 64 token 块排列的 bf16 或 fp16 `[B, H, NB*64, D]` 张量（D 为 64 或 128），每块前 `blk_cnt` 个是真实
+token。布局用 `to_blocked` 把真实 token 映射过去、用 `from_blocked` 映射回来，q、k、v、VSA 权重和 VSA2 门控都一样；
+填充位置输出为零，也不接收梯度。`sequence_layout(n, device)` 把一维序列切成连续的块；按光栅顺序排列的视频用
+`build_layout((T, H, W), R=16, device=...)`，每块是一个 4×4×4 tile，每个 16 token 路由组是其中的子立方体。
 
 ```python
+import torch
 from echosparse import vsa
 
-lay = vsa.build_layout((T, H, W), R=16, device="cuda")          # q, k, v, w: [B, heads, T*H*W, D]
-blocked = [vsa.to_blocked(x, lay) for x in (q, k, v, w)]
-out = vsa.from_blocked(vsa.vsa_attention(*blocked[:3], lay.blk_cnt, topk=32, weight=blocked[3]), lay)
-# VSA2：逐 token 的 gate 经同一布局转换，[B, heads, T*H*W] -> [B, heads, NB*64]
-q_b, k_b, v_b, gate_b = (vsa.to_blocked(x, lay) for x in (q, k, v, gate))
-out2 = vsa.from_blocked(vsa.vsa2_attention(q_b, k_b, v_b, gate_b, lay.blk_cnt, R=16, topk=32), lay)
+B, heads, n, D, dev = 1, 4, 4096, 64, "cuda"
+q, k, v = (torch.randn(B, heads, n, D, device=dev, dtype=torch.bfloat16, requires_grad=True) for _ in range(3))
+w = torch.rand(B, heads, n, D, device=dev, dtype=torch.bfloat16, requires_grad=True)     # VSA: full coarse weight
+gate = torch.randn(B, heads, n, device=dev, dtype=torch.bfloat16, requires_grad=True)    # VSA2: scalar gate per token
+
+lay = vsa.sequence_layout(n, dev)             # 视频：vsa.build_layout((T, H, W), R=16, device=dev)
+qb, kb, vb, wb, gb = (vsa.to_blocked(x, lay) for x in (q, k, v, w, gate))   # [B, heads, NB*64, ...]
+o_vsa = vsa.from_blocked(vsa.vsa_attention(qb, kb, vb, lay.blk_cnt, topk=16, weight=wb), lay)
+o_vsa2 = vsa.from_blocked(vsa.vsa2_attention(qb, kb, vb, gb, lay.blk_cnt, R=16, topk=16), lay)
+loss = o_vsa.float().square().mean() + o_vsa2.float().square().mean()
+loss.backward()                                                      # 一次反向经过共享的布局转换
 ```
 
 `python -m pytest tests/test_vsa.py tests/test_vsa2.py` 用 PyTorch 参考实现检查两者。
