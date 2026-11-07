@@ -22,6 +22,13 @@ B200 (SM100), RTX 5090 (SM120) and H100 (SM90) GPUs.
 
 ## News
 
+- **2026-11-08** — Native VSA2 kernels made faster on H100: a single-writer dK/dV store in the tier-A backward
+  and a shape-only coarse-metadata cache, both opt-in and both bit-exact on the forward. Measured against the
+  released kernel on the same H100 under one protocol: backward **0.965×**, complete autograd call **0.967×**,
+  forward **0.956×** at the shapes where the metadata matters. Achieved **23.5% MFU forward / 20.1% backward**
+  (median over six shapes), computed from the selection rather than from counters. See
+  [VSA2 kernel performance](#vsa2-kernel-performance-h100).
+
 - **2026-11-05** — Native CUDA [VSA and VSA2](#native-vsa-and-vsa2) in `echosparse.vsa`: forward and backward on H100
   (SM90) and RTX 5090 (SM120).
 - **2026-11-04** — EchoSparse runs on H100 (SM90): [results](#h100) · [usage](#on-an-h100).
@@ -122,6 +129,8 @@ while running 1.12–1.54× faster.
 - [x] Adapt EchoSparse to NVIDIA H100 (SM90).
 - [x] Report initial end-to-end H100 results for Wan2.1-1.3B.
 - [x] Native CUDA VSA and VSA2, forward and backward, on H100 (SM90) and RTX 5090 (SM120).
+- [x] Speed up the native VSA2 kernels on H100: single-writer dK/dV store, coarse-metadata cache, and a fused
+      router column stage (neutral, left opt-in).
 - [ ] Adapt EchoSparse to NVIDIA RTX 4090 (SM89).
 - [ ] Develop a producer-consumer architecture using TMA to reduce memory stalls further.
 
@@ -199,6 +208,48 @@ Offload groups contain one block for Wan, 16 for HunyuanVideo, and eight by defa
 The attention state kept between steps occupies about 1.89 GB for Wan2.1-14B (both CFG branches), 1.37 GB for
 HunyuanVideo and 0.63 GB for MiniMax-H3 at the resolutions above, plus one shared work buffer. It stays on the GPU
 throughout inference.
+
+### VSA2 kernel performance (H100)
+
+Measured on one H100 80 GB HBM3 against the released kernel in this repository, same build settings, same
+protocol: four processes per shape in ABBA order (default, arm, arm, default), CUDA events, warmup 10, 30
+iterations, 3 batches, an A/A arm for the noise floor, and ratios only from inside one run. Six shapes:
+L 4096-32768, H 8/16, D 128, plus `blk_cnt < 64` variants. `benchmarks/vsa2_kernel_bench.py` reproduces it.
+
+| toggle | forward | backward | complete autograd call |
+| --- | ---: | ---: | ---: |
+| `ECHOSPARSE_VSA_TK_BWD_STORE` | 1.007 | **0.965** (best 0.897) | **0.967** (best 0.929) |
+| `ECHOSPARSE_VSA_COARSE_META_CACHE` | **0.956** (best 0.644) | 0.989 | **0.984** (best 0.744) |
+| `ECHOSPARSE_VSA_FUSED_COLS` | 0.994 | 1.002 | 0.991 |
+
+Median ratios, lower is faster. The store removes two zero-fills of `[B, H, L, D]` fp32 accumulators and lets the
+owner CTA write its dK/dV tile, which also makes those gradients deterministic. The cache removes a per-call
+rebuild of shape-only int32 index tensors; it pays most on short sequences (0.644 at L4096) and converges to
+~0.98 by L16384. The fused column stage is bit-exact but does not resolve on native, so it stays opt-in.
+
+**Accuracy.** Forward `o` and the selection are bit-identical to the default on every shape. `dk`, `dv` and
+`dgate` are bit-identical (0 differing elements of 16-33M). `dq` is a cross-CTA fp32 reduce-add: its `rel_l2`
+against the default is at most 1.5e-5, while the same statistic between two default runs is at most 1.6e-5. Padded
+slots past `blk_cnt` are exactly zero. `tests/test_vsa2.py` (502 passed) and `tests/test_vsa.py` (143 passed) run
+on the same build.
+
+**MFU.** Achieved TFLOP/s is the algorithmic matmul FLOPs of the pairs the router actually selected — 4·64·64·D
+per pair for the forward, twice that for the backward — divided by the measured interval and by the 989.4
+TFLOP/s dense bf16 peak of this part. No hardware counter is involved, so it is reproducible anywhere the
+benchmark runs, and it is a whole-operator figure: the router, the coarse branch and the fusion are inside the
+same interval.
+
+| shape | MFU forward | MFU backward |
+| --- | ---: | ---: |
+| L4096/H8/D128 | 2.6% | 4.5% |
+| L8192/H16/D128 | 14.5% | 13.8% |
+| L16384/H8/D128 | 20.3% | 19.1% |
+| L16384/H16/D128 | 26.4% | 21.2% |
+| L32768/H8/D128 | 31.6% | 24.1% |
+
+The small shape is launch- and router-dominated, which is why its MFU is low; at 32K the kernel is at 31.6% of
+dense-bf16 peak for a 10%-density sparse attention. These are absolute figures for this build, not a claim about
+the paper's reported numbers.
 
 ### On an H100
 
