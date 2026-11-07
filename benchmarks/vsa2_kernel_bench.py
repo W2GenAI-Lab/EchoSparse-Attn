@@ -239,7 +239,8 @@ def run_shape(a, shape, scratch):
         except Exception as e:  # timings without their comparison must not read as a clean result
             return dict(status="failed", reason=f"comparing tensors: {type(e).__name__}: {e}")
         return dict(status="ok", topk=children[0]["topk"], blk_cnt=children[0]["blk_cnt"], run_order=list(ORDER),
-                    timing=time_rows(children), equivalence=eq, identity=children[0]["identity"],
+                    timing=time_rows(children), mfu=children[0].get("mfu"), equivalence=eq,
+                    identity=children[0]["identity"],
                     stale_extension_sources=sorted({n for c in children for n in c["stale_extension_sources"]}))
     finally:
         shutil.rmtree(work, ignore_errors=True)
