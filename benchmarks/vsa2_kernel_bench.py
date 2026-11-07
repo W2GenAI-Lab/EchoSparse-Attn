@@ -355,11 +355,12 @@ def measure(spec, shape):
     flops = dict(fwd=pairs * 4 * 64 * 64 * D, bwd=pairs * 8 * 64 * 64 * D)
     # achieved TFLOP/s and MFU per row: algorithmic matmul FLOPs divided by the measured interval
     peak = float(os.environ.get("VSA2_PEAK_TFLOPS", "989.4"))  # H100 SXM 80GB HBM3, dense bf16
-    for name, key, fl in (("vsa2.fwd", "fwd", flops["fwd"]), ("vsa2.bwd", "bwd", flops["bwd"]),
-                          ("vsa2.f_plus_b", "both", flops["fwd"] + flops["bwd"])):
+    mfu = {}
+    for name, fl in (("vsa2.fwd", flops["fwd"]), ("vsa2.bwd", flops["bwd"]),
+                     ("vsa2.f_plus_b", flops["fwd"] + flops["bwd"])):
         ms = statistics.median(rows[name])
         achieved = fl / (ms * 1e-3) / 1e12 if ms > 0 else 0.0
-        rows[name].update(flops=fl, achieved_tflops=achieved, mfu=achieved / peak, peak_tflops=peak)
+        mfu[name] = dict(flops=fl, achieved_tflops=achieved, mfu=achieved / peak, peak_tflops=peak)
     o.backward(dout)
     outputs = dict(o=o.detach(), dq=qq.grad, dk=kk.grad, dv=vv.grad, dgate=gg.grad)
     torch.save({name: t.detach().cpu() for name, t in outputs.items()}, spec["tensors"])
@@ -378,7 +379,7 @@ def measure(spec, shape):
         inputs=dict(seed=seed, **{name: digest(t) for name, t in (("q", q), ("k", k), ("v", v), ("dout", dout), ("gate", gate),
                                                                   ("blk_cnt", lay.blk_cnt))}))
     selection = hashlib.sha256("".join(digest(getattr(sel, f)) for f in ("q2k_ptr", "q2k_idx", "k2q_ptr", "k2q_idx")).encode()).hexdigest()
-    return dict(status="ok", topk=topk, rows=rows, digests=dict(o=digest(o), selection=selection), padded_slots=int((~valid).sum().item()),
+    return dict(status="ok", topk=topk, rows=rows, mfu=mfu, digests=dict(o=digest(o), selection=selection), padded_slots=int((~valid).sum().item()),
                 padded_nonzero=padded, tensors=spec["tensors"], identity=identity, stale_extension_sources=stale,
                 blk_cnt=dict(min=min(counts), max=max(counts), partial_blocks=sum(c < 64 for c in counts), blocks=nb))
 
@@ -440,7 +441,7 @@ def mfu_line(result):
     """One line per row: achieved TFLOP/s and MFU against the dense bf16 peak, from the selection."""
     out = []
     for name in ("vsa2.fwd", "vsa2.bwd", "vsa2.f_plus_b"):
-        r = result["rows"][name]
+        r = result.get("mfu", {}).get(name, {})
         out.append(f"{name} {r.get('mfu', float('nan')) * 100:5.1f}% MFU ({r.get('achieved_tflops', 0):6.1f} of {r.get('peak_tflops', 0):.0f} TFLOP/s)")
     return "; ".join(out)
 
