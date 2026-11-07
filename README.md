@@ -240,7 +240,7 @@ on the same build.
 - **time**: the fine kernel alone, through the same bindings the operator calls, not the whole call (which also
   contains the router, the coarse branch and the fusion);
 - **peak**: two large bf16 GEMMs on the same card, which sustain **793 TFLOP/s** against the 989.4 TFLOP/s
-  datasheet — so a percentage of datasheet understates the kernel by 25% on its own.
+  datasheet, so both denominators are given below.
 
 `benchmarks/vsa2_mfu_probe.py` reproduces all of it; no hardware counter is involved (ncu is not permitted on
 this machine), so both the work and the peak are measured from the run itself.
@@ -255,11 +255,8 @@ this machine), so both the work and the peak are measured from the run itself.
 | L32768/H16/D128 | 429 | 43.3% | 54.0% | 274 | 27.7% | 34.5% |
 
 The fine kernel reaches **44% of datasheet / 55% of what this card sustains** on the forward at 16K-32K, and
-**27% / 34%** on the backward. Quoting the operator instead of the kernel, and the datasheet instead of the
-measured peak, gives a much lower and much less informative figure: 23.5% forward median over the same shapes.
-Backward is lower than forward because it issues four matmuls per pair against two but has the same
-non-matmul epilogue (softmax recompute, dS, the dQ reduction), which is exactly where a hand-written kernel loses
-to GEMM.
+**27% / 34%** on the backward. Backward is lower than forward because it issues four matmuls per pair against two
+but has the same non-matmul epilogue (softmax recompute, dS, the dQ reduction).
 
 ### On an H100
 
