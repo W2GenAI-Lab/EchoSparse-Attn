@@ -354,6 +354,55 @@ __global__ void __launch_bounds__(kScanThreads) topk_colscan_kernel(int NB, int 
   if (threadIdx.x == 0) ptr[NB] = (int)(base + tot);
 }
 
+// topk_cols<false>, topk_colscan and topk_cols<true> as one kernel, one CTA per (b, h) (launch_global_topk's
+// fused_cols). Thread j counts column j with the same reads as topk_cols (a warp per selection word column,
+// a lane per bit), the CTA scans the counts into the kv->q row_ptr exactly as topk_colscan, and thread j then
+// emits column j's rows in ascending order. The same integers land in the same places; for NB <= 256 the
+// separate column kernels also ran one CTA per (b, h).
+__global__ void __launch_bounds__(kScanThreads) topk_cols_fused_kernel(int NB, int bh0, const int* state,
+                                                                       const uint32_t* selbits, int* colcnt,
+                                                                       int* k2q_ptr, int* k2q_idx) {
+  __shared__ int sscan[kScanThreads / 32];
+  const int bh = blockIdx.x;
+  const int W = words_of(NB);
+  const uint32_t* sel = selbits + (size_t)bh * NB * W;
+  int* cc = colcnt + (size_t)bh * NB;
+  for (int j = threadIdx.x; j < NB; j += kScanThreads) {
+    const uint32_t* col = sel + (j >> 5);
+    const int bit = j & 31;
+    int cnt = 0;
+    for (int i = 0; i < NB; ++i) cnt += (int)((col[(size_t)i * W] >> bit) & 1u);
+    cc[j] = cnt;
+  }
+  __syncthreads();  // counts visible to the scan
+
+  const int keff = state[bh * ST_STRIDE + ST_KEFF];
+  const int per = (NB + kScanThreads - 1) / kScanThreads;
+  const int r0 = min(NB, (int)threadIdx.x * per), r1 = min(NB, r0 + per);
+  int sum = 0;
+  for (int i = r0; i < r1; ++i) sum += cc[i];
+  int tot;
+  int ex = block_excl_scan(sum, sscan, &tot);
+  const long long base = (long long)(bh0 + bh) * keff;
+  int* ptr = k2q_ptr + (size_t)(bh0 + bh) * (NB + 1);
+  int run = ex;
+  for (int i = r0; i < r1; ++i) {
+    ptr[i] = (int)(base + run);
+    run += cc[i];
+  }
+  if (threadIdx.x == 0) ptr[NB] = (int)(base + tot);
+  __syncthreads();  // row_ptr visible to the emission
+
+  for (int j = threadIdx.x; j < NB; j += kScanThreads) {
+    const uint32_t* col = sel + (j >> 5);
+    const int bit = j & 31;
+    int* out = k2q_idx + ptr[j];
+    int n = 0;
+    for (int i = 0; i < NB; ++i)
+      if ((col[(size_t)i * W] >> bit) & 1u) out[n++] = i;
+  }
+}
+
 }  // namespace
 
 size_t topk_workspace_bytes(int bh_count, int NB) {
@@ -386,7 +435,7 @@ void topk_carve_workspace(void* base, int bh_count, int NB, TopkWorkspace* ws) {
   ws->colcnt = reinterpret_cast<int*>(p);
 }
 
-void launch_global_topk(const TopkParams& p, const TopkWorkspace& ws, cudaStream_t s) {
+void launch_global_topk(const TopkParams& p, const TopkWorkspace& ws, cudaStream_t s, bool fused_cols) {
   const int NB = p.NB, bhc = p.bh_count;
   const long long nn = (long long)NB * NB;
   const int W = (NB + 31) / 32;
@@ -408,6 +457,11 @@ void launch_global_topk(const TopkParams& p, const TopkWorkspace& ws, cudaStream
   topk_cut_kernel<<<bhc, kScanThreads, 0, s>>>(NB, p.bh0, ws.state, ws.eqbits, ws.gtcnt, ws.eqcnt, p.q2k_ptr);
   topk_emit_rows_kernel<<<rgrid, 256, 0, s>>>(NB, p.bh0, ws.state, ws.gtbits, ws.eqbits, ws.selbits, p.q2k_ptr,
                                               p.q2k_idx);
+  if (fused_cols) {
+    topk_cols_fused_kernel<<<bhc, kScanThreads, 0, s>>>(NB, p.bh0, ws.state, ws.selbits, ws.colcnt, p.k2q_ptr,
+                                                        p.k2q_idx);
+    return;
+  }
   dim3 cgrid((W + 7) / 8, bhc);
   topk_cols_kernel<false><<<cgrid, 256, 0, s>>>(NB, p.bh0, ws.selbits, ws.colcnt, nullptr, nullptr);
   topk_colscan_kernel<<<bhc, kScanThreads, 0, s>>>(NB, p.bh0, ws.state, ws.colcnt, p.k2q_ptr);

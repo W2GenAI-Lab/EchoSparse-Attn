@@ -748,3 +748,19 @@ def test_coarse_meta_cache_is_byte_exact(monkeypatch, nb):
     monkeypatch.setenv(ops.COARSE_META_CACHE_ENV, "1")
     for _ in range(2):
         assert torch.equal(ops.vsa2_attention(q, k, v, gate, cnt, topk=topk, backend="generic"), ref_o)
+
+
+@pytest.mark.parametrize("nb", [12, 70])
+def test_fused_cols_selection_is_byte_exact(monkeypatch, nb):
+    """ECHOSPARSE_VSA_FUSED_COLS=1 builds the kv->q CSR in one kernel; every selection tensor must be unchanged."""
+    gen = torch.Generator().manual_seed(31 + nb)
+    B, H, D = 2, 2, 64
+    cnt = counts(nb, "mixed", gen)
+    q, k, _, _ = inputs(B, H, nb, D, torch.bfloat16, cnt, seed=31)
+    sels = {}
+    for fused in ("0", "1"):
+        monkeypatch.setenv("ECHOSPARSE_VSA_FUSED_COLS", fused)
+        s = ops.route(q, k, cnt, R=16, topk=max(1, nb // 4))
+        sels[fused] = (s.q2k_ptr, s.q2k_idx, s.k2q_ptr, s.k2q_idx)
+    for a, b in zip(sels["0"], sels["1"]):
+        assert torch.equal(a, b)

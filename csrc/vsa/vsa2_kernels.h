@@ -147,7 +147,8 @@ struct TopkParams {
   int* k2q_ptr;
   int* k2q_idx;
 };
-void launch_global_topk(const TopkParams& p, const TopkWorkspace& ws, cudaStream_t s);
+// fused_cols: build the kv->q CSR in one kernel instead of three (same integers; ECHOSPARSE_VSA_FUSED_COLS)
+void launch_global_topk(const TopkParams& p, const TopkWorkspace& ws, cudaStream_t s, bool fused_cols = false);
 
 // ---------------------------------------------------------------- original VSA router
 // Whole-block coarse scores in the original's rounding: S = rnd(rnd(qc . kc) * scale), rnd = round to the
