@@ -92,9 +92,10 @@ def main():
                 # forward: the same binding the operator calls, with the frozen selection
                 fn_fwd = lambda: C.attn_fwd(qb, kb, vb, sel.q2k_ptr, sel.q2k_idx, lay.blk_cnt, True)
                 off, lse_f = fn_fwd()
-                o_ref, _ = vsa.vsa2_attention(qb, kb, vb, gb, lay.blk_cnt, R=16, topk=topk, backend="tk",
-                                              selection=sel, return_selection=True)
-                fwd_identical = torch.equal(off.float(), o_ref.float())
+                # determinism of the isolated kernel; equivalence against the operator's own output is covered by
+                # benchmarks/vsa2_kernel_bench.py, which has both the fused and the fine-only tensors available
+                off2, _ = fn_fwd()
+                fwd_identical = torch.equal(off, off2)
 
                 # backward: reconstruct dout_f and delta exactly as the operator does, then time the fine kernel
                 dout = torch.randn_like(qb)
@@ -122,7 +123,7 @@ def main():
                       f"({entry['fwd_mfu_datasheet']*100:.1f}% datasheet, {entry['fwd_mfu_achievable']*100:.1f}% achievable), "
                       f"bwd {ms_bwd:.3f} ms = {entry['bwd_tflops']:.0f} TFLOP/s "
                       f"({entry['bwd_mfu_datasheet']*100:.1f}%, {entry['bwd_mfu_achievable']*100:.1f}%), "
-                      f"fwd identical {fwd_identical}")
+                      f"isolated forward repeatable {fwd_identical}")
 
     results["note"] = "measurement_only: FLOPs from the selection; no hardware counters (ncu is not permitted here)"
     with open(a.out, "w") as f:

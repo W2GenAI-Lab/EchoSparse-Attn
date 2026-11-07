@@ -25,8 +25,8 @@ B200 (SM100), RTX 5090 (SM120) and H100 (SM90) GPUs.
 - **2026-11-08** — Native VSA2 kernels made faster on H100: a single-writer dK/dV store in the tier-A backward
   and a shape-only coarse-metadata cache, both opt-in and both bit-exact on the forward. Measured against the
   released kernel on the same H100 under one protocol: backward **0.965×**, complete autograd call **0.967×**,
-  forward **0.956×** at the shapes where the metadata matters. Achieved **23.5% MFU forward / 20.1% backward**
-  (median over six shapes), computed from the selection rather than from counters. See
+  forward **0.956×** at the shapes where the metadata matters. The fine kernel reaches **44% of datasheet / 55% of the measured peak** on the forward
+  (L16384-32768), measured with `benchmarks/vsa2_mfu_probe.py` rather than counted by a profiler. See
   [VSA2 kernel performance](#vsa2-kernel-performance-h100).
 
 - **2026-11-05** — Native CUDA [VSA and VSA2](#native-vsa-and-vsa2) in `echosparse.vsa`: forward and backward on H100
@@ -233,23 +233,33 @@ against the default is at most 1.5e-5, while the same statistic between two defa
 slots past `blk_cnt` are exactly zero. `tests/test_vsa2.py` (502 passed) and `tests/test_vsa.py` (143 passed) run
 on the same build.
 
-**MFU.** Achieved TFLOP/s is the algorithmic matmul FLOPs of the pairs the router actually selected — 4·64·64·D
-per pair for the forward, twice that for the backward — divided by the measured interval and by the 989.4
-TFLOP/s dense bf16 peak of this part. No hardware counter is involved, so it is reproducible anywhere the
-benchmark runs, and it is a whole-operator figure: the router, the coarse branch and the fusion are inside the
-same interval.
+**MFU, measured rather than assumed.** Three quantities decide the number, so each is measured here:
 
-| shape | MFU forward | MFU backward |
-| --- | ---: | ---: |
-| L4096/H8/D128 | 2.6% | 4.5% |
-| L8192/H16/D128 | 14.5% | 13.8% |
-| L16384/H8/D128 | 20.3% | 19.1% |
-| L16384/H16/D128 | 26.4% | 21.2% |
-| L32768/H8/D128 | 31.6% | 24.1% |
+- **work**: matmul FLOPs of the (query block, kv block) pairs the router actually selected — 4·64·64·D per pair
+  forward (QK^T and PV), twice that backward (dV, dP^T, dQ, dK);
+- **time**: the fine kernel alone, through the same bindings the operator calls, not the whole call (which also
+  contains the router, the coarse branch and the fusion);
+- **peak**: two large bf16 GEMMs on the same card, which sustain **793 TFLOP/s** against the 989.4 TFLOP/s
+  datasheet — so a percentage of datasheet understates the kernel by 25% on its own.
 
-The small shape is launch- and router-dominated, which is why its MFU is low; at 32K the kernel is at 31.6% of
-dense-bf16 peak for a 10%-density sparse attention. These are absolute figures for this build, not a claim about
-the paper's reported numbers.
+`benchmarks/vsa2_mfu_probe.py` reproduces all of it; no hardware counter is involved (ncu is not permitted on
+this machine), so both the work and the peak are measured from the run itself.
+
+| shape | forward TFLOP/s | % datasheet | % achievable | backward TFLOP/s | % datasheet | % achievable |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| L8192/H8/D128 | 329 | 33.3% | 41.5% | 211 | 21.3% | 26.6% |
+| L8192/H16/D128 | 363 | 36.7% | 45.8% | 234 | 23.6% | 29.4% |
+| L16384/H8/D128 | 409 | 41.4% | 51.6% | 259 | 26.2% | 32.6% |
+| L16384/H16/D128 | 441 | 44.5% | 55.5% | 269 | 27.2% | 33.9% |
+| L32768/H8/D128 | 430 | 43.5% | 54.2% | 273 | 27.6% | 34.4% |
+| L32768/H16/D128 | 429 | 43.3% | 54.0% | 274 | 27.7% | 34.5% |
+
+The fine kernel reaches **44% of datasheet / 55% of what this card sustains** on the forward at 16K-32K, and
+**27% / 34%** on the backward. Quoting the operator instead of the kernel, and the datasheet instead of the
+measured peak, gives a much lower and much less informative figure: 23.5% forward median over the same shapes.
+Backward is lower than forward because it issues four matmuls per pair against two but has the same
+non-matmul epilogue (softmax recompute, dS, the dQ reduction), which is exactly where a hand-written kernel loses
+to GEMM.
 
 ### On an H100
 
