@@ -733,3 +733,18 @@ def test_tk_bwd_store_matches_reduce(monkeypatch):
     with pytest.raises(RuntimeError):  # only 0 and 16 are TK backward options
         ext().tk_fine_bwd(q, k, v, dout, torch.zeros(B, H, nb * 64, device=DEV), torch.zeros(B, H, nb * 64, device=DEV),
                           sel.k2q_ptr, sel.k2q_idx, cnt, *[torch.zeros(q.shape, device=DEV) for _ in range(3)], opts=8)
+
+
+@pytest.mark.parametrize("nb", [12, 70])
+def test_coarse_meta_cache_is_byte_exact(monkeypatch, nb):
+    """ECHOSPARSE_VSA_COARSE_META_CACHE=1 reuses the shape-only coarse CSR; the output must not change (miss, hit)."""
+    gen = torch.Generator().manual_seed(29 + nb)
+    B, H, D = 2, 2, 64
+    cnt = counts(nb, "mixed", gen)
+    q, k, v, gate = inputs(B, H, nb, D, torch.bfloat16, cnt, seed=29)
+    topk = max(1, nb // 4)
+    monkeypatch.delenv(ops.COARSE_META_CACHE_ENV, raising=False)
+    ref_o = ops.vsa2_attention(q, k, v, gate, cnt, topk=topk, backend="generic")
+    monkeypatch.setenv(ops.COARSE_META_CACHE_ENV, "1")
+    for _ in range(2):
+        assert torch.equal(ops.vsa2_attention(q, k, v, gate, cnt, topk=topk, backend="generic"), ref_o)

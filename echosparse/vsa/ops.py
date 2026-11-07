@@ -36,6 +36,7 @@ _bwd_override: Optional[int] = None
 
 # Opt-in speed toggles: environment variables read on every call, off unless set to "1".
 TK_BWD_STORE_ENV = "ECHOSPARSE_VSA_TK_BWD_STORE"  # TK backward: single-writer dK/dV store, no kg/vg zero fill
+COARSE_META_CACHE_ENV = "ECHOSPARSE_VSA_COARSE_META_CACHE"  # reuse the coarse CSR metadata per shape
 TK_BWD_STORE_KV = 16  # the tk_fine_bwd opts bit
 
 
@@ -129,6 +130,20 @@ def _coarse_meta(B: int, H: int, nb: int, nbc_pad: int, device) -> Tuple[torch.T
     return cnt.contiguous(), ptr, idx
 
 
+_COARSE_META_CACHE = {}
+
+
+def _coarse_meta_for(B: int, H: int, nb: int, nbc_pad: int, device):
+    """_coarse_meta, reused per (B, H, nb, nbc_pad, device) when ECHOSPARSE_VSA_COARSE_META_CACHE=1. The tensors
+    are shape-only and only read, so one copy serves every call of a shape instead of a rebuild per forward."""
+    if not _env_on(COARSE_META_CACHE_ENV):
+        return _coarse_meta(B, H, nb, nbc_pad, device)
+    key = (B, H, nb, nbc_pad, str(device))
+    if key not in _COARSE_META_CACHE:
+        _COARSE_META_CACHE[key] = _coarse_meta(B, H, nb, nbc_pad, device)
+    return _COARSE_META_CACHE[key]
+
+
 def resolve_backend(backend: str, q: torch.Tensor) -> bool:
     """Returns True when the SM90 ThunderKittens fine kernels should be used."""
     C = ext()
@@ -205,7 +220,7 @@ class _Function(torch.autograd.Function):
         B, H, L, D = q.shape
         nb = L // 64
         qr, kr, qc, kc, vc = C.pool_fwd(q, k, v, blk_cnt, R)
-        c_cnt, c_ptr, c_idx = _coarse_meta(B, H, nb, qc.shape[2], q.device)
+        c_cnt, c_ptr, c_idx = _coarse_meta_for(B, H, nb, qc.shape[2], q.device)
         oc, lse_c = C.attn_fwd(qc, kc, vc, c_ptr, c_idx, c_cnt, False)
         if sel_in is None and router[0] == "rows":
             q2k_ptr, q2k_idx, k2q_ptr, k2q_idx = C.route_rows(qc, kc, nb, router[1], max_score_bytes)
