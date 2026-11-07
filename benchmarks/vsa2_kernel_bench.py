@@ -345,12 +345,6 @@ def measure(spec, shape):
         return [statistics.median(samples[i:i + I]) for i in range(0, len(samples), I)]
 
     rows = {"vsa2.fwd": loop(forward), "vsa2.bwd": direct(), "vsa2.f_plus_b": loop(f_plus_b)}
-    peak = float(os.environ.get("VSA2_PEAK_TFLOPS", "989.4"))  # H100 SXM 80GB HBM3, dense bf16
-    for name, key in (("vsa2.fwd", "fwd"), ("vsa2.bwd", "bwd"), ("vsa2.f_plus_b", "fwd")):
-        ms = statistics.median(rows[name])
-        achieved = flops[key] / (ms * 1e-3) / 1e12 if ms > 0 else 0.0
-        rows[name].update(flops=flops[key], achieved_tflops=achieved, mfu=achieved / peak, peak_tflops=peak)
-    rows["vsa2.f_plus_b"]["flops"] = flops["fwd"] + flops["bwd"]
 
     o, sel = forward(return_selection=True)
     # Algorithmic matmul FLOPs from the selection actually made, not from the budget: per selected
@@ -359,6 +353,13 @@ def measure(spec, shape):
     # peak; it needs no hardware counter, which matters because ncu is not permitted on this machine.
     pairs = int((sel.q2k_ptr[..., 1:] - sel.q2k_ptr[..., :-1]).sum().item())
     flops = dict(fwd=pairs * 4 * 64 * 64 * D, bwd=pairs * 8 * 64 * 64 * D)
+    # achieved TFLOP/s and MFU per row: algorithmic matmul FLOPs divided by the measured interval
+    peak = float(os.environ.get("VSA2_PEAK_TFLOPS", "989.4"))  # H100 SXM 80GB HBM3, dense bf16
+    for name, key, fl in (("vsa2.fwd", "fwd", flops["fwd"]), ("vsa2.bwd", "bwd", flops["bwd"]),
+                          ("vsa2.f_plus_b", "both", flops["fwd"] + flops["bwd"])):
+        ms = statistics.median(rows[name])
+        achieved = fl / (ms * 1e-3) / 1e12 if ms > 0 else 0.0
+        rows[name].update(flops=fl, achieved_tflops=achieved, mfu=achieved / peak, peak_tflops=peak)
     o.backward(dout)
     outputs = dict(o=o.detach(), dq=qq.grad, dk=kk.grad, dv=vv.grad, dgate=gg.grad)
     torch.save({name: t.detach().cpu() for name, t in outputs.items()}, spec["tensors"])
