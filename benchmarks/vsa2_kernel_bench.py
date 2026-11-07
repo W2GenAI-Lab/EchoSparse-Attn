@@ -345,8 +345,20 @@ def measure(spec, shape):
         return [statistics.median(samples[i:i + I]) for i in range(0, len(samples), I)]
 
     rows = {"vsa2.fwd": loop(forward), "vsa2.bwd": direct(), "vsa2.f_plus_b": loop(f_plus_b)}
+    peak = float(os.environ.get("VSA2_PEAK_TFLOPS", "989.4"))  # H100 SXM 80GB HBM3, dense bf16
+    for name, key in (("vsa2.fwd", "fwd"), ("vsa2.bwd", "bwd"), ("vsa2.f_plus_b", "fwd")):
+        ms = statistics.median(rows[name])
+        achieved = flops[key] / (ms * 1e-3) / 1e12 if ms > 0 else 0.0
+        rows[name].update(flops=flops[key], achieved_tflops=achieved, mfu=achieved / peak, peak_tflops=peak)
+    rows["vsa2.f_plus_b"]["flops"] = flops["fwd"] + flops["bwd"]
 
     o, sel = forward(return_selection=True)
+    # Algorithmic matmul FLOPs from the selection actually made, not from the budget: per selected
+    # (query block, kv block) pair and head the forward issues QK^T and PV (4 * 64 * 64 * D FLOPs) and the
+    # backward issues dV, dP^T, dQ and dK (twice that). MFU is those FLOPs over time divided by the dense bf16
+    # peak; it needs no hardware counter, which matters because ncu is not permitted on this machine.
+    pairs = int((sel.q2k_ptr[..., 1:] - sel.q2k_ptr[..., :-1]).sum().item())
+    flops = dict(fwd=pairs * 4 * 64 * 64 * D, bwd=pairs * 8 * 64 * 64 * D)
     o.backward(dout)
     outputs = dict(o=o.detach(), dq=qq.grad, dk=kk.grad, dv=vv.grad, dgate=gg.grad)
     torch.save({name: t.detach().cpu() for name, t in outputs.items()}, spec["tensors"])
@@ -423,6 +435,15 @@ def combined_verdict(res, aa=None):
     return shape_verdict(eq["forward"], backward, eq["padded_nonzero"])
 
 
+def mfu_line(result):
+    """One line per row: achieved TFLOP/s and MFU against the dense bf16 peak, from the selection."""
+    out = []
+    for name in ("vsa2.fwd", "vsa2.bwd", "vsa2.f_plus_b"):
+        r = result["rows"][name]
+        out.append(f"{name} {r.get('mfu', float('nan')) * 100:5.1f}% MFU ({r.get('achieved_tflops', 0):6.1f} of {r.get('peak_tflops', 0):.0f} TFLOP/s)")
+    return "; ".join(out)
+
+
 def report(pairs):
     """pairs: (A/A result or None, arm result)."""
     print(NOTE)
@@ -443,6 +464,10 @@ def report(pairs):
             if has_aa:
                 line += f" {aa['timing'][row]['ratio']:8.3f}" if aa["status"] == "ok" else f" {'n/a':>8s}"
             print(line)
+    print("\nMFU = algorithmic matmul FLOPs (from the selection) / time / dense bf16 peak; no counters involved")
+    for _aa, res in pairs:
+        if res.get("status") == "ok":
+            print(f"{shape_key(res['shape']):26s} {mfu_line(res)}")
     print(f"\n{'shape':26s} {'output':6s} {'rel_l2':>10s} {'A/A rel_l2':>10s} {'max_abs':>10s} {'A/A max_abs':>11s} {'n_diff':>9s} "
           f"{'A/A n_diff':>10s} {'of':>10s}  verdict")
     for aa, res in pairs:
