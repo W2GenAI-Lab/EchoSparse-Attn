@@ -252,6 +252,11 @@ struct bwd_globals {
   const int* __restrict__ row_ptr;  // VSA2: CSR kv->q
   const int* __restrict__ col_idx;
   const int* __restrict__ block_size;
+  // Single-writer dK/dV store (tk_fine_bwd opts bit 16): the grid is (NB, H, B) and the kernel is MHA, so each
+  // (b, h, kv block) has exactly one CTA. It stores its dK/dV tiles instead of reduce-adding them, and a CTA with
+  // an empty k2q list stores zeros, so kg/vg need no zero fill. Same values, except that a -0 element stays -0
+  // (the reduce-add computes 0 + -0 = +0).
+  const int store_kv;
 };
 
 __device__ static inline void stream_tile(auto& reg_tile, auto& smem_vec, int tic) {
@@ -288,7 +293,18 @@ __global__ __launch_bounds__(128, (D == 64) ? 3 : 2) void bwd_attend_ker(const _
   const int beg = rp[0];
   const int qo_blocks = rp[1] - beg;
   const int* k2q_block_sparse_index_ptr = g.col_idx + beg;
-  if (qo_blocks <= 0) return;  // dK/dV accumulators stay zero
+  if (qo_blocks <= 0) {  // dK/dV accumulators stay zero
+    if (g.store_kv) {      // they were not zero-filled: write this block's zeros
+      const size_t off = ((size_t)bh * g.NB + blockIdx.x) * (size_t)(BLOCK_N * D);
+      float4* kz = reinterpret_cast<float4*>(g.kg.raw_ptr + off);
+      float4* vz = reinterpret_cast<float4*>(g.vg.raw_ptr + off);
+      for (int i = threadIdx.x; i < BLOCK_N * D / 4; i += blockDim.x) {
+        kz[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+        vz[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+      }
+    }
+    return;
+  }
 
   extern __shared__ int __shm[];
   tma_swizzle_allocator al((int*)&__shm[0]);
@@ -434,7 +450,8 @@ __global__ __launch_bounds__(128, (D == 64) ? 3 : 2) void bwd_attend_ker(const _
   __syncthreads();
   if (threadIdx.x / 32 == 0) {
     coord<kg_tile> tile_idx = {blockIdx.z, kv_head_idx, blockIdx.x, 0};
-    tma::store_add_async(g.kg, kg_smem[0], tile_idx);
+    if (g.store_kv) tma::store_async(g.kg, kg_smem[0], tile_idx);
+    else tma::store_add_async(g.kg, kg_smem[0], tile_idx);
     tma::store_commit_group();
   }
 
@@ -442,7 +459,8 @@ __global__ __launch_bounds__(128, (D == 64) ? 3 : 2) void bwd_attend_ker(const _
   __syncthreads();
   if (kittens::warpid() % 4 == 0) {
     coord<vg_tile> tile_idx = {blockIdx.z, kv_head_idx, blockIdx.x, 0};
-    tma::store_add_async(g.vg, vg_smem[0], tile_idx);
+    if (g.store_kv) tma::store_async(g.vg, vg_smem[0], tile_idx);
+    else tma::store_add_async(g.vg, vg_smem[0], tile_idx);
     tma::store_commit_group();
   }
   tma::store_async_wait();
@@ -477,7 +495,7 @@ static void tk_fwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch
 template <int D>
 static void tk_bwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor dout_f, torch::Tensor lse,
                         torch::Tensor delta, torch::Tensor row_ptr, torch::Tensor col_idx, torch::Tensor blk_cnt,
-                        torch::Tensor qg_acc, torch::Tensor kg_acc, torch::Tensor vg_acc) {
+                        torch::Tensor qg_acc, torch::Tensor kg_acc, torch::Tensor vg_acc, bool store_kv) {
   using G = bwd_globals<D>;
   const unsigned B = q.size(0), H = q.size(1), L = q.size(2);
   typename G::q_gl a_q{reinterpret_cast<bf16*>(q.data_ptr<c10::BFloat16>()), B, H, L, (unsigned)D};
@@ -491,7 +509,7 @@ static void tk_bwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch
   typename G::d_gl a_d{delta.data_ptr<float>(), B, H, 1U, L};
   const int NB = L / BLOCK_N;
   G g{a_q, a_k, a_v, a_og, a_qg, a_kg, a_vg, a_l, a_d, NB,
-      row_ptr.data_ptr<int>(), col_idx.data_ptr<int>(), blk_cnt.data_ptr<int>()};
+      row_ptr.data_ptr<int>(), col_idx.data_ptr<int>(), blk_cnt.data_ptr<int>(), (int)store_kv};
   constexpr int mem_size = (D == 64) ? 72000 : 113000;
   cudaFuncSetAttribute(bwd_attend_ker<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
   dim3 grid(NB, H, B);
@@ -508,13 +526,14 @@ void vsa2_tk_fine_fwd(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::
   else vsa2_tk::tk_fwd_impl<128>(q, k, v, o, lse, row_ptr, col_idx, blk_cnt);
 }
 
-// qg/kg/vg: fp32 [B, H, L, D] zero-initialized accumulators (written with TMA reduce-add)
+// qg: fp32 [B, H, L, D] zero-initialized accumulator (written with TMA reduce-add). kg/vg: the same, or, with
+// store_kv, any fp32 [B, H, L, D] buffers (every element is stored; see bwd_globals::store_kv)
 void vsa2_tk_fine_bwd(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor dout_f, torch::Tensor lse,
                       torch::Tensor delta, torch::Tensor row_ptr, torch::Tensor col_idx, torch::Tensor blk_cnt,
-                      torch::Tensor qg, torch::Tensor kg, torch::Tensor vg) {
+                      torch::Tensor qg, torch::Tensor kg, torch::Tensor vg, bool store_kv) {
   const c10::cuda::OptionalCUDAGuard guard(q.device());
   if (q.size(3) == 64)
-    vsa2_tk::tk_bwd_impl<64>(q, k, v, dout_f, lse, delta, row_ptr, col_idx, blk_cnt, qg, kg, vg);
+    vsa2_tk::tk_bwd_impl<64>(q, k, v, dout_f, lse, delta, row_ptr, col_idx, blk_cnt, qg, kg, vg, store_kv);
   else
-    vsa2_tk::tk_bwd_impl<128>(q, k, v, dout_f, lse, delta, row_ptr, col_idx, blk_cnt, qg, kg, vg);
+    vsa2_tk::tk_bwd_impl<128>(q, k, v, dout_f, lse, delta, row_ptr, col_idx, blk_cnt, qg, kg, vg, store_kv);
 }

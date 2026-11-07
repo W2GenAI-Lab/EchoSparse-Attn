@@ -23,6 +23,7 @@ Preblocked layout contract (layout.py builds it from real tokens):
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -32,6 +33,25 @@ from .dispatch import check_bwd_variant, select_bwd_variant
 
 _C = None
 _bwd_override: Optional[int] = None
+
+# Opt-in speed toggles: environment variables read on every call, off unless set to "1".
+TK_BWD_STORE_ENV = "ECHOSPARSE_VSA_TK_BWD_STORE"  # TK backward: single-writer dK/dV store, no kg/vg zero fill
+TK_BWD_STORE_KV = 16  # the tk_fine_bwd opts bit
+
+
+def _env_on(name: str) -> bool:
+    return os.environ.get(name) == "1"
+
+
+def _tk_bwd_kv(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """dK/dV accumulators and opts for C.tk_fine_bwd. With ECHOSPARSE_VSA_TK_BWD_STORE=1 the kernel stores every
+    element (its grid is (NB, H, B) and it is MHA, so each (b, h, kv block) has one owner CTA, which writes zeros
+    for an empty list), so the accumulators are allocated uninitialised. dQ is unchanged; dK/dV are the same
+    values except that a -0 element stays -0 instead of becoming +0."""
+    store = _env_on(TK_BWD_STORE_ENV)
+    alloc = torch.empty if store else torch.zeros
+    return (alloc(q.shape, device=q.device, dtype=torch.float32), alloc(q.shape, device=q.device, dtype=torch.float32),
+            TK_BWD_STORE_KV if store else 0)
 
 
 def ext():
@@ -229,9 +249,8 @@ class _Function(torch.autograd.Function):
         # fine branch on the exact forward selection, + coarse unpooling
         if ctx.use_tk:
             dq_acc = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
-            dk_acc = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
-            dv_acc = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
-            C.tk_fine_bwd(q, k, v, dout_f, lse_f, delta_f, k2q_ptr, k2q_idx, blk_cnt, dq_acc, dk_acc, dv_acc)
+            dk_acc, dv_acc, opts = _tk_bwd_kv(q)
+            C.tk_fine_bwd(q, k, v, dout_f, lse_f, delta_f, k2q_ptr, k2q_idx, blk_cnt, dq_acc, dk_acc, dv_acc, opts)
             dk = C.finalize(dk_acc, dkc, blk_cnt, k)
             dv = C.finalize(dv_acc, dvc, blk_cnt, v)
             dq = C.finalize(dq_acc, dqc, blk_cnt, q)
@@ -342,9 +361,8 @@ class _FineFunction(torch.autograd.Function):
             dout_f = dout
         if ctx.use_tk:
             dq_acc = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
-            dk_acc = torch.zeros_like(dq_acc)
-            dv_acc = torch.zeros_like(dq_acc)
-            C.tk_fine_bwd(q, k, v, dout_f, lse, delta_f, kp, ki, blk_cnt, dq_acc, dk_acc, dv_acc)
+            dk_acc, dv_acc, opts = _tk_bwd_kv(q)
+            C.tk_fine_bwd(q, k, v, dout_f, lse, delta_f, kp, ki, blk_cnt, dq_acc, dk_acc, dv_acc, opts)
             dk = C.finalize(dk_acc, None, blk_cnt, k)
             dv = C.finalize(dv_acc, None, blk_cnt, v)
             dq = C.finalize(dq_acc, None, blk_cnt, q)

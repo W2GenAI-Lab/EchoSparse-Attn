@@ -18,7 +18,7 @@ void vsa2_tk_fine_fwd(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::
                       torch::Tensor row_ptr, torch::Tensor col_idx, torch::Tensor blk_cnt);
 void vsa2_tk_fine_bwd(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor dout_f, torch::Tensor lse,
                       torch::Tensor delta, torch::Tensor row_ptr, torch::Tensor col_idx, torch::Tensor blk_cnt,
-                      torch::Tensor qg, torch::Tensor kg, torch::Tensor vg);
+                      torch::Tensor qg, torch::Tensor kg, torch::Tensor vg, bool store_kv);
 #endif
 
 using namespace vsa2;
@@ -450,12 +450,18 @@ std::map<std::string, int64_t> device_limits() {
 }
 
 #ifdef VSA2_WITH_TK
+// opts: 0, or 16 = single-writer dK/dV store (kg / vg need not be zeroed; qg must be)
+static void check_tk_bwd_opts(int64_t opts) {
+  TORCH_CHECK(opts == 0 || opts == 16, "TK backward opts: 0, or 16 (single-writer dK/dV store)");
+}
+
 void tk_fine_bwd(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor dout_f, torch::Tensor lse,
                  torch::Tensor delta, torch::Tensor row_ptr, torch::Tensor col_idx, torch::Tensor blk_cnt,
-                 torch::Tensor qg, torch::Tensor kg, torch::Tensor vg) {
+                 torch::Tensor qg, torch::Tensor kg, torch::Tensor vg, int64_t opts) {
   check_tokens(q, "q");
   TORCH_CHECK(q.scalar_type() == torch::kBFloat16, "TK backend is bf16 only");
-  vsa2_tk_fine_bwd(q, k, v, dout_f, lse, delta, row_ptr, col_idx, blk_cnt, qg, kg, vg);
+  check_tk_bwd_opts(opts);
+  vsa2_tk_fine_bwd(q, k, v, dout_f, lse, delta, row_ptr, col_idx, blk_cnt, qg, kg, vg, (opts & 16) != 0);
   check_launch();
 }
 #endif
@@ -578,6 +584,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("set_fwd_variant", &vsa2::set_fwd_variant);
   m.def("get_fwd_variant", &vsa2::get_fwd_variant);
 #ifdef VSA2_WITH_TK
-  m.def("tk_fine_bwd", &tk_fine_bwd);
+  m.def("tk_fine_bwd", &tk_fine_bwd, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("dout_f"), py::arg("lse"),
+        py::arg("delta"), py::arg("row_ptr"), py::arg("col_idx"), py::arg("blk_cnt"), py::arg("qg"), py::arg("kg"),
+        py::arg("vg"), py::arg("opts") = 0);
 #endif
 }

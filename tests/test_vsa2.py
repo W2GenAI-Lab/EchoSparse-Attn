@@ -703,3 +703,33 @@ def test_tk_ignores_generic_bwd_variant():
         pytest.skip("needs the SM90 TK backend")
     _, _, o = _small_full(backend="tk", bwd_variant=2)
     assert (o.grad_fn.bwd_variant, o.grad_fn.bwd_source) == (None, "tk")
+
+
+def test_tk_bwd_store_matches_reduce(monkeypatch):
+    """ECHOSPARSE_VSA_TK_BWD_STORE=1 (tk_fine_bwd opts 16): each kv block's owner CTA stores dK/dV into
+    uninitialised accumulators instead of reduce-adding into zeroed ones, and writes zeros for a kv block no
+    query block selects. dK, dV and dgate must equal the default path (== treats -0 and +0 as equal); dQ is
+    still reduce-added by several CTAs in no fixed order, so it is compared with a tolerance."""
+    if "tk" not in BACKENDS:
+        pytest.skip("needs the SM90 TK backend")
+    gen = torch.Generator().manual_seed(23)
+    B, H, nb, D = 2, 2, 12, 128
+    cnt = counts(nb, "mixed", gen)
+    q, k, v, gate = inputs(B, H, nb, D, torch.bfloat16, cnt, seed=23)
+    mask = random_mask(B, H, nb, gen, "random")
+    mask[..., 2] = False  # kv block 2 has an empty k2q list: its CTA must write zeros
+    sel = ops.mask_to_selection(mask)
+    dout = torch.randn_like(q)
+    grads = {}
+    for store in ("0", "1"):
+        monkeypatch.setenv(ops.TK_BWD_STORE_ENV, store)
+        leaves = [x.clone().requires_grad_(True) for x in (q, k, v, gate)]
+        o = ops.vsa2_attention(*leaves, cnt, selection=sel, backend="tk")
+        grads[store] = torch.autograd.grad(o, leaves, dout)
+    ref_g, got_g = grads["0"], grads["1"]
+    check("tk_bwd_store_dq", got_g[0], ref_g[0], 1e-2)
+    for n, a, b in zip(("dk", "dv", "dgate"), got_g[1:], ref_g[1:]):
+        assert (a == b).all(), f"store path changed {n}"
+    with pytest.raises(RuntimeError):  # only 0 and 16 are TK backward options
+        ext().tk_fine_bwd(q, k, v, dout, torch.zeros(B, H, nb * 64, device=DEV), torch.zeros(B, H, nb * 64, device=DEV),
+                          sel.k2q_ptr, sel.k2q_idx, cnt, *[torch.zeros(q.shape, device=DEV) for _ in range(3)], opts=8)
